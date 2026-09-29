@@ -1,6 +1,6 @@
 ---
 name: RFD3 Modal pipeline
-overview: "Build a new Modal pipeline from scratch for protein design: one campaign YAML drives RFD3, backbone filters, SolubleMPNN, structure prediction, then cross validation structure prediction with five seeds, and ranks by cross-model ipSAE."
+overview: "Build a new Modal pipeline from scratch for design: one campaign YAML drives RFD3, backbone filters, SolubleMPNN, structure prediction, then cross validation structure prediction with five seeds, and ranks by cross-model ipSAE."
 ---
 
 # RFD3 pipeline on Modal
