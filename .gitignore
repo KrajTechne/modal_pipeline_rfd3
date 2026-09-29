@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.pytest_cache/
+
+# Virtual environments. The project's venv lives outside the repo
+# (~/venvs/rfd3-pipeline) because this tree is OneDrive-synced and because
+# deep site-packages paths hit the Windows MAX_PATH limit here; these patterns
+# cover the case where someone creates one in-tree anyway.
+.venv/
+venv/
+env/
+
+# Local runs and scratch output
+out/
+outputs/
+*.log
