@@ -146,6 +146,7 @@ def build_summary_json(
     run_name: str,
     n_specs: int,
     stage_gates: Mapping[str, Iterable],
+    dry_run: bool = False,
 ) -> dict:
     """The funnel: how many designs reached each stage, and what failed them.
 
@@ -156,6 +157,9 @@ def build_summary_json(
     counts = {
         "campaign": campaign,
         "run": run_name,
+        # Recorded so the artifact itself says whether these numbers describe a
+        # real campaign, independent of whoever saw the console banner.
+        "dry_run": dry_run,
         "n_specs": n_specs,
         "n_designs": len(records),
         "steps": {
@@ -184,6 +188,7 @@ def write_summaries(
     run_name: str,
     n_specs: int,
     stage_gates: Mapping[str, Iterable],
+    dry_run: bool = False,
 ) -> dict[str, Path]:
     """Write both summaries beside the shards, returning where they landed."""
     directory = Path(directory)
@@ -194,7 +199,9 @@ def write_summaries(
     csv_path.write_text(build_summary_csv(records))
     json_path.write_text(
         json.dumps(
-            build_summary_json(records, campaign, run_name, n_specs, stage_gates),
+            build_summary_json(
+                records, campaign, run_name, n_specs, stage_gates, dry_run
+            ),
             indent=2,
             default=str,
         )

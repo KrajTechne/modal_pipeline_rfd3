@@ -31,8 +31,12 @@ from .contig import (
 )
 
 __all__ = [
+    "DRY_RUN_OVERRIDES",
+    "DRY_RUN_SUFFIX",
     "CampaignConfig",
     "CrossValidationConfig",
+    "apply_dry_run",
+    "dry_run_banner",
     "FoldingModel",
     "GeneralConfig",
     "IpsaeConfig",
@@ -506,6 +510,77 @@ class IpsaeConfig(_Base):
 
 class RunConfig(_Base):
     dry_run: bool = False
+    """Smoke-test scale: see `apply_dry_run`.
+
+    A campaign that quietly produced a handful of designs because this was left
+    on would be a miserable thing to debug, so it is never only a flag. It
+    renames the run, so dry-run output lands in its own directory and can never
+    be mistaken for a real campaign, and it is recorded in `summary.json`.
+    """
+
+
+# Appended to `run_name` whenever dry-run is active. The point is that the
+# output directory itself says so -- nobody should have to find the flag to
+# explain why a campaign made two designs.
+DRY_RUN_SUFFIX = "-dryrun"
+
+# What dry-run reduces. One spec, the smallest batch that still exercises the
+# per-batch code paths, and the cheapest folding configuration. Everything else
+# -- contigs, thresholds, chains, the ligand -- is left exactly as configured,
+# because the point is to exercise the real campaign's shape at a scale where a
+# mistake costs minutes.
+DRY_RUN_OVERRIDES: dict[str, dict[str, Any]] = {
+    "rfdiffusion3": {"n_batches": 1, "diffusion_batch_size": 2, "max_concurrent": 1},
+    "mpnn": {"num_seqs": 2, "max_concurrent": 1},
+    "refolding": {"model": "esmfold2", "mode": "fast", "max_concurrent": 1},
+    "cross_validation": {"num_seeds": 1, "max_concurrent": 1},
+}
+
+
+def apply_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
+    """Reduce a raw campaign payload to smoke-test scale.
+
+    Operates on the parsed YAML before validation, so the result is validated
+    like any other campaign and a bad override fails the same way a bad file
+    would. Keeps only the first spec, and renames the run.
+
+    Returns a new dict; the input is not modified.
+    """
+    reduced = {
+        section: {**payload.get(section, {}), **changes}
+        for section, changes in DRY_RUN_OVERRIDES.items()
+        if section in payload
+    }
+    merged = {**payload, **reduced}
+
+    specs = merged.get("rfdiffusion3", {}).get("specs") or []
+    if specs:
+        merged["rfdiffusion3"] = {**merged["rfdiffusion3"], "specs": specs[:1]}
+
+    general = dict(merged.get("general", {}))
+    run_name = str(general.get("run_name", "run"))
+    if not run_name.endswith(DRY_RUN_SUFFIX):
+        general["run_name"] = run_name + DRY_RUN_SUFFIX
+    merged["general"] = general
+
+    merged["run"] = {**merged.get("run", {}), "dry_run": True}
+    return merged
+
+
+def dry_run_banner(campaign: CampaignConfig) -> str:
+    """A loud, specific description of what dry-run changed."""
+    rfd3 = campaign.rfdiffusion3
+    return (
+        "DRY RUN -- smoke-test scale, not a real campaign.\n"
+        f"  run_name : {campaign.general.run_name} "
+        f"(suffixed, so output cannot be confused with a real run)\n"
+        f"  specs    : {len(rfd3.specs)} ({rfd3.specs[0].name})\n"
+        f"  designs  : {rfd3.total_designs} "
+        f"({rfd3.n_batches} batch x {rfd3.diffusion_batch_size})\n"
+        f"  seqs/des : {campaign.mpnn.num_seqs}\n"
+        f"  cv seeds : {campaign.cross_validation.num_seeds}\n"
+        "  Remove --dry-run for the configured campaign."
+    )
 
 
 class CampaignConfig(_Base):

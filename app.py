@@ -251,6 +251,7 @@ def reduce_summaries(campaign_payload: dict) -> dict:
         run_name=campaign.general.run_name,
         n_specs=len(campaign.rfdiffusion3.specs),
         stage_gates={Stage.BACKBONE_FILTERS: backbone_gates(campaign.rfdiffusion3)},
+        dry_run=campaign.run.dry_run,
     )
     data_volume.commit()
 
@@ -258,6 +259,7 @@ def reduce_summaries(campaign_payload: dict) -> dict:
     return {
         "n_records": len(records),
         "n_passing_backbone_filters": passing,
+        "dry_run": campaign.run.dry_run,
         "written": {name: str(path) for name, path in paths.items()},
     }
 
@@ -303,7 +305,7 @@ def orchestrate(campaign_payload: dict, start_at: str = "rfd3", chunk_size: int 
 # ---------------------------------------------------------------------------
 # Local entrypoints
 # ---------------------------------------------------------------------------
-def _prepare(campaign_path: str) -> tuple[dict, str, str]:
+def _prepare(campaign_path: str, dry_run: bool = False) -> tuple[dict, str, str]:
     """Validate and resolve locally, then upload what the run needs.
 
     Resolution happens here so a bad campaign fails on the client in seconds,
@@ -313,11 +315,22 @@ def _prepare(campaign_path: str) -> tuple[dict, str, str]:
 
     import yaml
 
-    from rfd3_pipeline.config import CampaignConfig
+    from rfd3_pipeline.config import CampaignConfig, apply_dry_run, dry_run_banner
     from rfd3_pipeline.spec import dump_rfd3_specs, resolve_campaign
 
     repo = Path(__file__).resolve().parent
-    campaign = CampaignConfig.model_validate(yaml.safe_load(Path(campaign_path).read_text()))
+    payload = yaml.safe_load(Path(campaign_path).read_text())
+    if dry_run:
+        payload = apply_dry_run(payload)
+
+    campaign = CampaignConfig.model_validate(payload)
+
+    # Printed after validation so the banner reports the settings that will
+    # actually run, not the ones requested.
+    if campaign.run.dry_run:
+        rule = "=" * 72
+        print(f"\n{rule}\n{dry_run_banner(campaign)}\n{rule}\n")
+
     resolved = resolve_campaign(campaign, structure_root=repo)
     for warning in resolved.warnings:
         print(f"WARNING: {warning}")
@@ -347,8 +360,20 @@ def io_bytes(text: str):
 
 
 @app.local_entrypoint()
-def run(campaign: str, start_at: str = "rfd3", chunk_size: int = 32):
-    payload, _, _ = _prepare(campaign)
+def run(
+    campaign: str,
+    start_at: str = "rfd3",
+    chunk_size: int = 32,
+    dry_run: bool = False,
+):
+    """Run a campaign.
+
+    `--dry-run` reduces it to smoke-test scale -- one spec, two designs, one
+    cross-validation seed -- and renames the run so its output lands in a
+    separate directory. A campaign that mysteriously produced two designs is
+    almost always this flag, which is why the rename and the banner exist.
+    """
+    payload, _, _ = _prepare(campaign, dry_run=dry_run)
     report = orchestrate.remote(payload, start_at=start_at, chunk_size=chunk_size)
     _show(report)
 
