@@ -60,6 +60,23 @@ class TestParseContig:
     def test_tolerates_whitespace(self):
         assert parse_contig(" 100-120 , /0 , B1-177 ") == parse_contig("100-120,/0,B1-177")
 
+    def test_parses_the_sampled_contig_rfd3_writes_back(self):
+        """RFD3's `extra.sampled_contig` is fully expanded and type-annotated.
+
+        A real one reads `115P,/0,B1,B2,...,B177,/0,C1,...` -- the drawn length
+        carries a polymer-type suffix and every input residue is listed
+        individually, so the campaign-contig parser has to accept both.
+        """
+        sampled = "115P,/0,B1,B2,B3,/0,C1,C2"
+        components = parse_contig(sampled)
+        assert components[0] == Designed(115, 115)
+        assert components[0].is_fixed
+        assert components[2] == FromInput("B", 1, 1)
+        assert len(segments(components)) == 3
+
+    def test_polymer_suffix_does_not_change_the_count(self):
+        assert parse_contig("115P") == parse_contig("115")
+
     @pytest.mark.parametrize("bad", ["", "   ", ",,,"])
     def test_rejects_empty(self, bad):
         with pytest.raises(ValueError, match="empty contig|no components"):

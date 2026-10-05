@@ -65,7 +65,11 @@ _CHAIN_RESIDUE = r"([A-Za-z][A-Za-z0-9]*?)(\d+)"
 
 _FROM_INPUT = re.compile(rf"^{_CHAIN_RESIDUE}(?:-(\d+))?$")
 _RESIDUE_KEY = re.compile(rf"^{_CHAIN_RESIDUE}$")
-_DESIGNED = re.compile(r"^(\d+)(?:-(\d+))?$")
+# The trailing letters are a polymer-type marker. A campaign contig never has
+# one, but the `sampled_contig` RFD3 writes into a design's metadata does --
+# it reports the drawn length as e.g. `115P` for 115 protein residues. Accepted
+# and ignored, since only the count affects output numbering.
+_DESIGNED = re.compile(r"^(\d+)(?:-(\d+))?([A-Za-z]*)$")
 _CHAIN_BREAK = re.compile(r"^/(\d+)$")
 
 ResidueKey = tuple[str, int]
@@ -293,15 +297,20 @@ def map_input_to_output(
 
 
 def derive_length(components: Sequence[Component], structure=None) -> tuple[int, int]:
-    """Total design length as (minimum, maximum), across all chains.
+    """Residues the contig alone accounts for, as (minimum, maximum).
 
-    This is what RFD3's `length` field constrains, and the reason the pipeline
-    never accepts a hand-typed value: `length` and `contig` encode overlapping
-    information, so a typo in one produces designs of the wrong size with no
-    error.
+    **Not the size of the built system.** Measured against two real RFD3 builds,
+    unindexed motif residues are *added* to the designed region rather than
+    placed inside it, and the ligand adds a residue of its own:
+
+        designed + unindexed + target residues + ligand = what RFD3 reports
+
+    For `100-120,/0,B1-177,/0,C1-242` with `unindex: A77-79` and one Mn, RFD3
+    sampled 115 designed residues and reported 538 residues in: 115 + 3 + 419 + 1.
+    See `ResolvedSpec.expected_length`, which adds the rest.
 
     With `structure`, input ranges are counted by residues actually present, so
-    a gapped chain gives the true length rather than the nominal span.
+    a gapped chain gives the true count rather than the nominal span.
     """
     present = residues_by_chain(structure) if structure is not None else None
 

@@ -38,7 +38,7 @@ from ..contig import (
     parse_residue_key,
     renumber_hotspots,
 )
-from ..structure import chains_present
+from ..structure import ca_only, chains_present
 
 __all__ = [
     "DesignMetadata",
@@ -49,9 +49,12 @@ __all__ = [
     "renumber_hotspots_for_design",
 ]
 
+# Confirmed against a real design's metadata JSON. Its top-level keys are
+# ckpt_path, diffused_index_map, metrics, seed, specification -- so the sampled
+# contig is nested two deep under `specification`, not at the top level.
 _INDEX_MAP_KEY = "diffused_index_map"
-_EXTRA_KEY = "extra"
-_SAMPLED_CONTIG_KEY = "sampled_contig"
+_METRICS_KEY = "metrics"
+_SAMPLED_CONTIG_PATH = ("specification", "extra", "sampled_contig")
 
 
 @dataclass(frozen=True)
@@ -86,6 +89,18 @@ class DesignMetadata:
     binder_entries: dict[ResidueKey, ResidueKey]
     target_entries: dict[ResidueKey, ResidueKey]
     sampled_contig: str | None
+    metrics: dict[str, float]
+    """RFD3's own per-design metrics, flattened to the numeric entries.
+
+    Carries most of what the backbone filter needs without recomputing it:
+    `n_clashing.interresidue_clashes_w_backbone`,
+    `n_clashing.interresidue_clashes_w_sidechain`, `loop_fraction`, and
+    `radius_of_gyration`. Measured on one design, RFD3's `radius_of_gyration`
+    (12.58) tracks our own binder-chain figure (12.46) to about 1%, so it
+    appears to describe the diffused region rather than the whole complex -- but
+    the pipeline still computes its own, because ours is unambiguously the
+    binder chain and the two can then be compared over a real batch.
+    """
 
     def motif_map(self, binder_chain: str) -> MotifMap:
         if not self.binder_entries:
@@ -124,13 +139,26 @@ def parse_design_metadata(payload: dict, binder_chain: str) -> DesignMetadata:
         else:
             target_entries[source] = destination
 
-    extra = payload.get(_EXTRA_KEY)
-    sampled = extra.get(_SAMPLED_CONTIG_KEY) if isinstance(extra, dict) else None
+    node: object = payload
+    for step in _SAMPLED_CONTIG_PATH:
+        node = node.get(step) if isinstance(node, dict) else None
+
+    raw_metrics = payload.get(_METRICS_KEY)
+    metrics = (
+        {
+            str(name): float(value)
+            for name, value in raw_metrics.items()
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+        }
+        if isinstance(raw_metrics, dict)
+        else {}
+    )
 
     return DesignMetadata(
         binder_entries=binder_entries,
         target_entries=target_entries,
-        sampled_contig=sampled if isinstance(sampled, str) else None,
+        sampled_contig=node if isinstance(node, str) else None,
+        metrics=metrics,
     )
 
 
@@ -196,19 +224,31 @@ def renumber_hotspots_for_design(
     return mapping
 
 
-def assert_output_chains(structure, expected: Sequence[str]) -> None:
-    """Check the design's chains are exactly the configured binder and targets.
+def assert_output_chains(structure, expected: Sequence[str]) -> list[str]:
+    """Check the design's *polymer* chains are the configured binder and targets.
 
     The convention -- binder first, then targets in contig order, lettered from A
     -- is derived from how RFD3 renumbers, not guaranteed by it. Asserting it on
     the first design of each spec turns a contig whose ordering differs from the
     declared chains into an immediate failure, rather than a campaign of ipSAE
     columns attributed to the wrong chain.
+
+    Ligand chains are excluded rather than counted. A design built with
+    `ligand: "E703"` comes out with chains `A, B, C, E` -- the ligand keeps its
+    *input* chain id instead of being renumbered with the polymers -- so
+    comparing every chain against the declared list would fail on every design
+    that uses a ligand. Polymer chains are those carrying alpha carbons, which
+    a metal ion does not.
+
+    Returns the non-polymer chain ids found, for the caller to record.
     """
-    present = chains_present(structure)
-    if present != sorted(expected):
+    polymers = sorted(
+        {str(chain) for chain in ca_only(structure).chain_id}
+    )
+    if polymers != sorted(expected):
         raise ValueError(
-            f"design has chains {present} but the campaign declares "
+            f"design has polymer chains {polymers} but the campaign declares "
             f"{sorted(expected)}. Check the contig's chain order against "
             "chain_binder / chain_targets."
         )
+    return [chain for chain in chains_present(structure) if chain not in polymers]

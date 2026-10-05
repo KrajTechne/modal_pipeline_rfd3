@@ -20,9 +20,29 @@ def resolved(raw, alphav_structure):
 
 
 class TestResolveTheRealCampaign:
-    def test_length_is_derived(self, resolved):
-        assert all(spec.length == (519, 539) for spec in resolved.specs)
-        assert resolved.specs[0].length_string == "519-539"
+    def test_contig_length_is_derived(self, resolved):
+        assert all(spec.contig_length == (519, 539) for spec in resolved.specs)
+
+    def test_expected_length_adds_only_the_ligand(self, resolved):
+        """Measured against a real design: the designed chain comes out at
+        exactly the sampled length, so unindexed motif residues sit inside it
+        and only the ligand adds a residue."""
+        core, extended = resolved.specs
+        assert core.n_ligand_residues == 1  # ligand: "E703"
+        assert core.expected_length == (520, 540)  # 519-539 + 1 Mn
+        assert core.length_string == "520-540"
+        # 530 observed on the real design (110 + 177 + 242 + 1) is inside it.
+        low, high = core.expected_length
+        assert low <= 530 <= high
+
+    def test_unindexed_counts_are_recorded_but_not_summed(self, resolved):
+        """They explain the metadata's num_residues_in, which counts the
+        guideposts as separate input tokens before they are merged in."""
+        core, extended = resolved.specs
+        assert (core.n_unindexed, extended.n_unindexed) == (3, 7)
+        # Same contig and same ligand, so the finished designs are the same size
+        # despite the differing unindex counts.
+        assert core.expected_length == extended.expected_length
 
     def test_output_chains_match_the_declaration(self, resolved):
         assert all(spec.output_chains == ["A", "B", "C"] for spec in resolved.specs)
@@ -55,13 +75,13 @@ class TestResolveTheRealCampaign:
         assert not hasattr(resolved, "structure")
         payload = resolved.to_dict()
         assert yaml.safe_dump(payload)  # round-trips through plain YAML
-        assert payload["specs"][0]["length"] == (519, 539)
+        assert payload["specs"][0]["contig_length"] == (519, 539)
 
     def test_loads_the_structure_from_disk_when_not_given(self, raw):
         result = resolve_campaign(
             CampaignConfig.model_validate(raw), structure_root=REPO_ROOT
         )
-        assert result.specs[0].length == (519, 539)
+        assert result.specs[0].contig_length == (519, 539)
 
     def test_missing_structure_raises(self, raw):
         merged = build(raw, rfdiffusion3={"path_input_structure": "nope/missing.pdb"})
@@ -93,7 +113,7 @@ class TestStructureConsistency:
 
         assert any("58 residue(s) not in the input structure" in w for w in result.warnings)
         # The derived length reflects what exists, not what was asked for.
-        assert result.specs[0].length == (519, 539)
+        assert result.specs[0].contig_length == (519, 539)
 
     def test_contig_component_matching_nothing_raises(self, raw, alphav_structure):
         merged = with_contig(raw, "100-120,/0,B1-177,/0,C900-950")

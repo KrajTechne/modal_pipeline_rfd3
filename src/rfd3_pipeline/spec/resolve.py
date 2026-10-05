@@ -26,9 +26,9 @@ from ..contig import (
     ResidueKey,
     derive_length,
     expected_output_chains,
-    format_residue,
     format_residues,
     map_input_to_output,
+    parse_residue_key,
     renumber_hotspots,
 )
 from ..structure import chain_sequence, load_structure, residues_by_chain
@@ -50,7 +50,9 @@ class ResolvedSpec:
     contig: str
     unindex: str | None
     select_fixed_atoms: dict[str, str]
-    length: tuple[int, int]
+    contig_length: tuple[int, int]
+    n_unindexed: int
+    n_ligand_residues: int
     output_chains: list[str]
     hotspots: dict[ResidueKey, ResidueKey]
     target_chain_map: dict[str, str]
@@ -63,9 +65,27 @@ class ResolvedSpec:
     """
 
     @property
+    def expected_length(self) -> tuple[int, int]:
+        """Residues in the *finished* design, as (minimum, maximum).
+
+        Measured against a real design: the designed chain comes out at exactly
+        the sampled length, so unindexed motif residues are placed *within* it,
+        not added to it. Only the ligand adds a residue of its own.
+
+        `n_unindexed` is recorded but deliberately not summed here. It explains
+        the metadata's `num_residues_in`, which counts the unindexed guideposts
+        as separate input tokens (110 designed + 3 guideposts + 419 target + 1 Mn
+        = 533) -- but `cleanup_guideposts` defaults to True, so they are merged
+        into the designed chain before output and the finished structure holds
+        110 + 177 + 242 + 1 Mn = 530.
+        """
+        low, high = self.contig_length
+        return low + self.n_ligand_residues, high + self.n_ligand_residues
+
+    @property
     def length_string(self) -> str:
-        """RFD3's `min-max` form, or a bare integer when the length is fixed."""
-        low, high = self.length
+        """`min-max`, or a bare integer when the length is fixed."""
+        low, high = self.expected_length
         return str(low) if low == high else f"{low}-{high}"
 
     def hotspots_by_output_chain(self) -> dict[str, list[int]]:
@@ -193,6 +213,42 @@ def _check_selections(
         )
 
 
+def _count_ligand_residues(ligand: str | None, structure) -> int:
+    """Residues the `ligand` field pulls in, counted against the structure.
+
+    RFD3 splits the field on commas and resolves each component by chemical
+    component name first, falling back to a chain+residue index -- so `"MN"`
+    may match several residues while `"E703"` matches one.
+    """
+    if not ligand:
+        return 0
+
+    residues = {
+        (str(chain), int(resi))
+        for chain, resi in zip(structure.chain_id, structure.res_id)
+    }
+    total = 0
+    for raw in ligand.split(","):
+        token = raw.strip()
+        if not token:
+            continue
+        try:
+            key = parse_residue_key(token)
+        except ValueError:
+            by_name = structure.res_name == token
+            total += len(
+                {
+                    (str(chain), int(resi))
+                    for chain, resi in zip(
+                        structure.chain_id[by_name], structure.res_id[by_name]
+                    )
+                }
+            )
+        else:
+            total += 1 if key in residues else 0
+    return total
+
+
 def _resolve_spec(
     spec: SpecConfig,
     campaign: CampaignConfig,
@@ -206,14 +262,19 @@ def _resolve_spec(
     chain_map, rename_warnings = _build_chain_map(spec, mapping)
     warnings.extend(rename_warnings)
 
-    _check_selections(spec, spec.unindexed_residues, set(mapping), present)
+    unindexed = spec.unindexed_residues
+    _check_selections(spec, unindexed, set(mapping), present)
 
     resolved = ResolvedSpec(
         name=spec.name,
         contig=spec.contig,
         unindex=spec.unindex,
         select_fixed_atoms=dict(spec.select_fixed_atoms),
-        length=derive_length(components, structure=structure),
+        contig_length=derive_length(components, structure=structure),
+        n_unindexed=len(unindexed),
+        n_ligand_residues=_count_ligand_residues(
+            campaign.rfdiffusion3.ligand, structure
+        ),
         output_chains=expected_output_chains(components),
         hotspots=renumber_hotspots(
             campaign.rfdiffusion3.hotspots, components, structure=structure

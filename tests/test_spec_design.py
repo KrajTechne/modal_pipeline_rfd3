@@ -37,7 +37,9 @@ def alphav_payload(**overrides):
             "C10": "C10",
             "C225": "C225",
         },
-        "extra": {"sampled_contig": "112,/0,B1-177,/0,C1-242"},
+        # Nested exactly as a real design's metadata nests it.
+        "specification": {"extra": {"sampled_contig": "112,/0,B1-177,/0,C1-242"}},
+        "metrics": {"loop_fraction": 0.25, "radius_of_gyration": 12.5},
     }
     payload.update(overrides)
     return payload
@@ -70,13 +72,16 @@ class TestDesignMetadata:
         assert metadata.target_entries[("B", 59)] == ("B", 59)
         assert ("A", 77) not in metadata.target_entries
 
-    def test_sampled_contig_read_from_extra(self):
+    def test_sampled_contig_read_from_specification_extra(self):
         assert alphav_metadata().sampled_contig == "112,/0,B1-177,/0,C1-242"
 
     def test_sampled_contig_absent_is_none(self):
         payload = alphav_payload()
-        payload.pop("extra")
+        payload.pop("specification")
         assert parse_design_metadata(payload, "A").sampled_contig is None
+
+    def test_numeric_metrics_are_kept(self):
+        assert alphav_metadata().metrics["loop_fraction"] == 0.25
 
     def test_raises_when_the_map_is_absent(self):
         with pytest.raises(KeyError, match="diffused_index_map"):
@@ -163,7 +168,7 @@ class TestRenumberForDesign:
         metadata = parse_design_metadata(
             {
                 "diffused_index_map": {"B30": "A20"},
-                "extra": {"sampled_contig": "B1-5,14,B30-32"},
+                "specification": {"extra": {"sampled_contig": "B1-5,14,B30-32"}},
             },
             binder_chain="Z",  # nothing lands on the binder in this stub
         )
@@ -185,7 +190,32 @@ class TestOutputChains:
             + make_atoms("B", [1, 2], np.zeros((2, 3)))
             + make_atoms("C", [1, 2], np.zeros((2, 3)))
         )
-        assert_output_chains(design, ["A", "B", "C"])
+        assert assert_output_chains(design, ["A", "B", "C"]) == []
+
+    def test_ligand_chains_are_tolerated_and_reported(self):
+        """A real design with `ligand: "E703"` comes out as A/B/C/E.
+
+        The ligand keeps its *input* chain id rather than being renumbered with
+        the polymers, so comparing every chain against the declared list would
+        fail on every design that uses one.
+        """
+        metal = make_atoms("E", [703], np.zeros((1, 3)), atom_name="MN")
+        metal.res_name = np.array(["MN"])
+        metal.element = np.array(["MN"])
+        design = (
+            make_atoms("A", [1, 2], np.zeros((2, 3)))
+            + make_atoms("B", [1, 2], np.zeros((2, 3)))
+            + make_atoms("C", [1, 2], np.zeros((2, 3)))
+            + metal
+        )
+        assert assert_output_chains(design, ["A", "B", "C"]) == ["E"]
+
+    def test_a_missing_polymer_chain_still_fails_with_a_ligand_present(self):
+        metal = make_atoms("E", [703], np.zeros((1, 3)), atom_name="MN")
+        metal.res_name = np.array(["MN"])
+        design = make_atoms("A", [1], np.zeros((1, 3))) + metal
+        with pytest.raises(ValueError, match="polymer chains"):
+            assert_output_chains(design, ["A", "B", "C"])
 
     def test_assert_catches_a_missing_chain(self):
         design = make_atoms("A", [1], np.zeros((1, 3))) + make_atoms(

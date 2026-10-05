@@ -17,6 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 INPUTS = REPO_ROOT / "inputs_motif_scaffold_alphav_beta3"
 ALPHAV_PDB = INPUTS / "alphav_beta3_fib10_clean.pdb"
 CAMPAIGN_YAML = INPUTS / "alphav_rgd_unindex_claude.yaml"
+FIXTURES = Path(__file__).resolve().parent / "fixtures"
 
 # The campaign under development. Kept here so the derived length (519-539)
 # asserted in several files cannot drift apart from the contig it comes from.
