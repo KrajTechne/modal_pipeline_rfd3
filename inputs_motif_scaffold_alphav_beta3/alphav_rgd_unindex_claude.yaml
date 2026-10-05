@@ -1,0 +1,155 @@
+# Campaign config: alphaV/beta3 RGD motif scaffolding.
+#
+# Revised copy of alphav_rgd_unindex.yaml, migrated to the schema in
+# modal_rfd3_pipeline_plan_claude.md. The original is left untouched for diffing.
+#
+# Verified against inputs_motif_scaffold_alphav_beta3/alphav_beta3_fib10_clean.pdb:
+#   chain A  93 aa, resi 1-93    (FN10; A77-79 = ARG-GLY-ASP)
+#   chain B 177 aa, resi 1-177   (no gaps)
+#   chain C 242 aa, resi 1-242   (no gaps)
+
+general:
+  chain_binder: A
+  chain_targets: [B, C]          # list, not a comma string
+  name_design_campaign: motif_scaffold_alphav_beta3
+  run_name: alphav_beta3_01
+  base_seed: 0                   # cross-validation seeds derive from this
+
+  # Keyed by chain so each can be asserted against the input structure at load.
+  # Both confirmed to match the PDB exactly (177 aa / 242 aa).
+  seq_targets:
+    B: QWFGASVRSKQDKILACAPLYHWRTEMKQEREPVGTCFLQDGTKTVEYAPCRSQDIDADGQGFCQGGFSIDFTKADRVLLGGPGSFYWQGQLISDQVAEIVSKYDPNVYSIKYNNQLATRTAQAIFDDSYLGYSVAVGDFNGDGIDDFVSGVPRAARTLGMVYIYDGKNMSSLYNFT
+    C: VDIYYLMDLSYSMKDDLWSIQNLGTKLATQMRKLTSNLRIGFGAFVDKPVSPYMYISPPEALENPCYDMKTTCLPMFGYKHVLTLTDQVTRFNEEVKKQSVSRNRDAPEGGFDAIMQATVCDEKIGWRNDASHLLVFTTDAKTHIALDGRLAGIVQPNDGQCHVGSDNHYSASTTMDYPSLGLMTEKLSQKNINLIFAVTENVVNLYQNYSELIPGTTVGVLSMDSSNVLQLIVDAYGKIRS
+
+rfdiffusion3:
+  gpu: A100-80GB
+  max_concurrent: 2              # one container per spec
+  path_input_structure: inputs_motif_scaffold_alphav_beta3/alphav_beta3_fib10_clean.pdb
+
+  # One object per spec, with an explicit `name`: RFD3 output keys stay stable
+  # if specs are added, removed or reordered, so a resumed run's skip_existing
+  # still matches the right prior outputs.
+  #
+  # select_fixed_atoms matters here. Only the atoms marked fixed are carried
+  # over from the input (input.md:151), and RGD is a side-chain motif — the
+  # arginine guanidinium and aspartate carboxylate ARE the binding determinants.
+  # BKBN would discard exactly what makes it bind, so RGD is fixed as ALL.
+  # In the extended spec the flanking loop residues are backbone-only, since
+  # they provide geometry rather than contacts.
+  specs:
+    - name: rgd_core
+      contig: "100-120,/0,B1-177,/0,C1-242"
+      unindex: "A77-79"          # RGD
+      select_fixed_atoms:
+        A77-79: ALL
+
+    - name: rgd_extended
+      contig: "100-120,/0,B1-177,/0,C1-242"
+      unindex: "A75-81"          # T-G-[RGD]-S-P
+      select_fixed_atoms:
+        A75-76: BKBN
+        A77-79: ALL
+        A80-81: BKBN
+
+  hotspots: "B59,B86,B87,B89,B121,B124,B127,C10,C11,C12,C15,C102,C103,C104,C105,C106,C107,C109,C225"
+  infer_ori_strategy: hotspots
+  is_non_loopy: true
+  dialect: 2
+
+  # The beta3 MIDAS metal. Measured in the input structure: E703 is 2.12 A from
+  # the RGD aspartate (A79) carboxylate and is co-coordinated by C10/C12 (the
+  # DXSXS serines) and C109 -- i.e. the RGD Asp completes its coordination
+  # sphere. Scaffolding RGD without it would omit the motif's principal
+  # interaction.
+  #
+  # Only E703 is named here because RFD3 requires each ligand residue to sit on
+  # its own chain, and E703/E704/E705 all share chain E. Including the full
+  # beta3 triad (MIDAS + ADMIDAS at 7.7 A + SyMBS at 5.9 A) means first splitting
+  # them into separate chains in the input PDB.
+  #
+  # D1004 is deliberately excluded: it is an alphaV propeller site 41 A from the
+  # RGD Asp and contributes nothing to the interface.
+  #
+  # Ligands do not affect `length` -- RFD3 appends them after building the
+  # contig -- and they default to a fully fixed motif, which is what a
+  # structural metal should be.
+  ligand: "E703"
+
+  # DERIVED, never typed. From the contig: 100-120 designed + 177 (B) + 242 (C)
+  # = 519-539. The original file said 510-570, which matched neither the old
+  # contig (80-120 -> 499-539) nor the new one; its range was also 60 wide where
+  # the designed segment is 20. Left null so rfd3_spec computes and asserts it.
+  length: null
+
+  n_batches: 5                   # was num_batches
+  diffusion_batch_size: 8        # was num_designs
+  # -> 5 x 8 x 2 specs = 80 backbones
+
+  # Sampler knobs at RFD3 stock, exposed for tuning.
+  num_timesteps: 200
+  step_scale: 1.5
+  gamma_0: 0.6
+
+  threshold_interresidue_clashes_backbone: 0
+  threshold_interresidue_clashes_sidechain: 3
+  threshold_loop_fraction: 0.5
+  threshold_radius_gyration_multiplier: 1.1
+  threshold_hotspot_contacts: 0.4
+
+mpnn:
+  gpu: L40S
+  max_concurrent: 8
+  mpnn_type: soluble             # soluble | protein | ligand
+  mpnn_sampling_temp: 0.1
+  num_seqs: 8
+  rm_aa: C
+  # --fixed_residues is derived from diffused_index_map (output numbering),
+  # never set here.
+
+refolding:
+  # esmfold2 = the full model, which reads MSAs; esmfold2-fast = ESMFold2-Fast,
+  # which does not. The kit's --variant is derived from this plus whether the
+  # step supplies an MSA: apo -> full_nomsa, holo -> full_msa (or `fast` for
+  # both under esmfold2-fast, where a target MSA would be ignored).
+  model: esmfold2
+  mode: fast                     # off | exact | fast | big
+  gpu: A100-80GB                 # the kit --config card is derived from this
+  n_gpu_shard: 1                 # >1 only under mode: big (2|4|8)
+  max_concurrent: 4              # Modal containers (was `n_gpu`)
+  chunk_size: 24                 # sequences per container; amortizes model load
+  target_template: false         # esmfold2 cannot template; true is rejected
+
+  threshold_plddt_binder: 70
+  threshold_rmsd_apo_holo: 4.0
+  threshold_rmsd_motif: 2.0
+  threshold_ipTM: 0.3
+
+cross_validation:                # was `cross-validation`; hyphen is awkward in Python
+  model: af3_jax
+  variant: p2                    # names the checkpoint the kit loads
+  weights: openfold3             # openfold3 | af3_native -- see note below
+  mode: exact
+  gpu: A100-80GB
+  n_gpu_shard: 1
+  max_concurrent: 4
+  chunk_size: 8
+  target_template: false
+  num_seeds: 5                   # seeds derived from general.base_seed
+
+msa:
+  host_url: https://api.colabfold.com
+  use_env: true
+  use_filter: true
+  pairing_strategy: greedy
+  # Unauthenticated against the public endpoint. Both auth paths stay plumbed
+  # through so a private/self-hosted MMseqs2 server is a config change only.
+  username: null
+  password: null
+  auth_header: null
+
+ipsae:
+  pae_cutoff: 10                 # explicit: the helper defaults to 15
+  dist_cutoff: 10
+
+run:
+  dry_run: false

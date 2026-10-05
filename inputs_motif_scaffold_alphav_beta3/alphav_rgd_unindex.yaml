@@ -1,0 +1,49 @@
+cross-validation:
+  gpu: A100-80GB
+  model: af3_jax # Native AlphaFold3 from Google Deepmind with official weights (under af3_jax)
+  mode: exact # Mode from Anthropic's uplifting biomolecular structure prediction module with accelerated kernels for common structure prediction models
+  target_template: false
+  n_gpu: 4 # Number of concurrent GPUs to run on Modal
+  num_seeds: 5
+general:
+  chain_binder: A
+  chain_targets: B,C
+  name_design_campaign: motif_scaffold_alphav_beta3
+  run_name: alphav_beta3_01
+  seq_targets: QWFGASVRSKQDKILACAPLYHWRTEMKQEREPVGTCFLQDGTKTVEYAPCRSQDIDADGQGFCQGGFSIDFTKADRVLLGGPGSFYWQGQLISDQVAEIVSKYDPNVYSIKYNNQLATRTAQAIFDDSYLGYSVAVGDFNGDGIDDFVSGVPRAARTLGMVYIYDGKNMSSLYNFT,VDIYYLMDLSYSMKDDLWSIQNLGTKLATQMRKLTSNLRIGFGAFVDKPVSPYMYISPPEALENPCYDMKTTCLPMFGYKHVLTLTDQVTRFNEEVKKQSVSRNRDAPEGGFDAIMQATVCDEKIGWRNDASHLLVFTTDAKTHIALDGRLAGIVQPNDGQCHVGSDNHYSASTTMDYPSLGLMTEKLSQKNINLIFAVTENVVNLYQNYSELIPGTTVGVLSMDSSNVLQLIVDAYGKIRS
+mpnn:
+  gpu: L40S
+  mpnn_sampling_temp: 0.1
+  num_seqs: 8
+  rm_aa: C
+  use_solubleMPNN: true
+refolding:
+  gpu: A100-80GB
+  model: esmfold2-fast
+  mode: fast
+  target_template: false
+  n_gpu: 4 # means number of concurrent GPUs to run on Modal
+  threshold_plddt_binder: 70
+  threshold_rmsd_apo_holo: 4.0
+  threshold_ipTM: 0.3
+  threshold_rmsd_motif: 2.0
+rfdiffusion3:
+  contigs:
+  - 100-120,/0,B1-177,/0,C1-242
+  - 100-120,/0,B1-177,/0,C1-242
+  hotspots: B59,B86,B87,B89,B121,B124,B127,C10,C11,C12,C15,C102,C103,C104,C105,C106,C107,C109,C225
+  infer_ori_strategy: hotspots
+  is_non_loopy: true
+  num_batches: 5
+  num_designs: 8
+  length: 510-570 # Length of all fixed residues and designed residues in the entire complex, not solely for binder
+  unindex:
+  - A77-79,/0,/0
+  - A75-81,/0,/0
+  path_input_structure: inputs_motif_scaffold_alphav_beta3/alphav_beta3_fib10_clean.pdb
+  num_timesteps: 200
+  threshold_interresidue_clashes_sidechain: 3
+  threshold_interresidue_clashes_backbone: 0
+  threshold_loop_fraction: 0.5
+  threshold_radius_gyration_multiplier: 1.1
+  threshold_hotspot_contacts: 0.4
