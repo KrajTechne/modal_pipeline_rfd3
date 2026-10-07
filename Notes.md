@@ -408,6 +408,63 @@ intersection-by-taxonomy behaviour is standard ColabFold pairing semantics,
 server-side, and is **[unconfirmed]** here. Either way, suppressing the binder
 protects target pairing depth as well as keeping the sequence in-house.
 
+### Worked example: binder + one target, binder suppressed
+
+Both binder fields set, target left at `None`:
+
+| step | line | outcome |
+|---|---|---|
+| unpaired list | `:195` | `[target]` -- binder excluded, its field is set |
+| unpaired query | `:199` | fires, target gets a real a3m |
+| paired list | `:212` | `[target]` -- binder excluded |
+| paired query | `:215` | `len == 1`, not `> 1`, so **never fires** |
+| early return | `:235` | unpaired list non-empty, so does *not* return |
+| applied to target | `:244`, `:246` | unpaired <- real MSA; paired <- `''` |
+
+So the target ends with a real unpaired MSA and `paired_msa = ''` -- empty
+string, not `None`. That is not a loss: with one target there is nothing to pair
+*with*. Pairing only means anything with two or more unsuppressed chains, i.e.
+two or more target chains. The alphaV/beta3 campaign has two distinct targets,
+so pairing does fire between them, and suppressing the binder is what keeps it
+out of that pair.
+
+**The outcome flips once the target is pre-populated**, which is what a cache
+creates. Set the target's `unpaired_msa` from cache and leave its `paired_msa`
+as `None`:
+
+- the unpaired list is now empty, every chain having one set
+- `:235` checks **only** the unpaired list, so the early return fires
+- `return fold_input` unchanged -- the target's `paired_msa` stays `None` and is
+  never defaulted to `''`
+
+And with two or more targets it is worse: the paired query at `:215` runs
+*before* that early return, so the sequences go out and the answer is then
+discarded.
+
+**So do not rely on `fill_missing_msas` for anything once you pre-populate.**
+Set every field on every chain explicitly and treat that function as a no-op
+being deliberately bypassed. The plan's own `msa_client.py` is what does the
+querying; this function is upstream's convenience path, and it is only safe when
+nothing has been filled in already.
+
+### What is worth caching
+
+**Cache the unpaired MSAs, not the paired ones.** An unpaired MSA is a property
+of a single sequence, so it is context-free and cacheable by sequence. A paired
+MSA is a property of the *set* of chains queried together, so it is not
+cacheable in general -- the same chain paired against a different partner gives
+a different answer.
+
+One consequence specific to this pipeline, worth noticing: because the binder is
+always suppressed, the pairing context is exactly the target set, and the
+targets do not change across a campaign. So for a given campaign the paired MSA
+for the targets is also constant, and could be computed once rather than per
+prediction -- 640 queries saved at this campaign's full scale (80 designs x 8
+sequences). That holds *only* while the
+binder is excluded from pairing; include it and the context becomes per-design
+and nothing about pairing is cacheable. **[unconfirmed]** -- the reasoning
+follows from the code above, but no paired query has been run yet.
+
 ### Two further quirks in that function
 
 **The paired query needs more than one unsuppressed chain** (`:215`). With a

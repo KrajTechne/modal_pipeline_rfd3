@@ -515,12 +515,17 @@ def _as_int(value):
 # ---------------------------------------------------------------------------
 # Backbone filters
 # ---------------------------------------------------------------------------
-@app.function(image=cpu_image, cpu=4.0, memory=16384, volumes=VOLUMES, timeout=2 * HOUR)
+@app.function(image=cpu_image, cpu=1.0, memory=4096, volumes=VOLUMES, timeout=2 * HOUR)
 def filter_designs(design_ids: list[str], campaign_payload: dict) -> dict:
     """Filter a chunk of designs, writing one shard each.
 
     Chunked rather than one design per container: the per-call overhead of
     starting a container dwarfs the few hundred milliseconds of filtering.
+
+    One CPU, not four: the loop below is sequential, and the arrays are a few
+    thousand atoms, far too small for BLAS threading to earn a second core.
+    4 GiB rather than 16: the old figure predated replacing the dense contact
+    mask with neighbour indices, and even that mask was 92 MB at 3000 residues.
     """
     from pathlib import Path
 
@@ -659,9 +664,18 @@ def orchestrate(campaign_payload: dict, start_at: str = "rfd3", chunk_size: int 
 
     if reached <= stages.index(Stage.RFD3):
         spec_names = [spec.name for spec in rfd3.specs]
-        print(f"phase rfd3: fanning out to {spec_names}", flush=True)
+        print(
+            f"phase rfd3: fanning out to {spec_names}, "
+            f"max_concurrent={rfd3.max_concurrent}",
+            flush=True,
+        )
+        # `max_concurrent` is campaign config, so it cannot be a decorator
+        # argument: decorators run at import, before any campaign is read.
+        # `with_options` is the runtime equivalent.
         rfd3_results = list(
-            run_rfd3.map(spec_names, kwargs={"campaign_payload": campaign_payload})
+            run_rfd3.with_options(max_containers=rfd3.max_concurrent).map(
+                spec_names, kwargs={"campaign_payload": campaign_payload}
+            )
         )
         report["rfd3"] = rfd3_results
         designs = [d for result in rfd3_results for d in result["designs"]]
@@ -694,12 +708,15 @@ def orchestrate(campaign_payload: dict, start_at: str = "rfd3", chunk_size: int 
     chunks = chunked(passing)
     print(
         f"phase mpnn: {len(passing)} of {len(designs)} passed, "
-        f"{len(chunks)} chunk(s) of up to {chunk_size}",
+        f"{len(chunks)} chunk(s) of up to {chunk_size}, "
+        f"max_concurrent={campaign.mpnn.max_concurrent}",
         flush=True,
     )
     if chunks:
         report["mpnn"] = list(
-            run_mpnn.map(chunks, kwargs={"campaign_payload": campaign_payload})
+            run_mpnn.with_options(max_containers=campaign.mpnn.max_concurrent).map(
+                chunks, kwargs={"campaign_payload": campaign_payload}
+            )
         )
 
     print("phase reduce", flush=True)
