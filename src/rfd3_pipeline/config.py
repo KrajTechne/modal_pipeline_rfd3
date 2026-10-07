@@ -530,7 +530,9 @@ DRY_RUN_SUFFIX = "-dryrun"
 # because the point is to exercise the real campaign's shape at a scale where a
 # mistake costs minutes.
 DRY_RUN_OVERRIDES: dict[str, dict[str, Any]] = {
-    "rfdiffusion3": {"n_batches": 1, "diffusion_batch_size": 2, "max_concurrent": 1},
+    # Three designs rather than two: enough that the backbone filters can both
+    # pass and fail within one run, which two cannot reliably do.
+    "rfdiffusion3": {"n_batches": 1, "diffusion_batch_size": 3, "max_concurrent": 1},
     "mpnn": {"num_seqs": 2, "max_concurrent": 1},
     "refolding": {"model": "esmfold2", "mode": "fast", "max_concurrent": 1},
     "cross_validation": {"num_seeds": 1, "max_concurrent": 1},

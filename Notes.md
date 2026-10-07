@@ -131,6 +131,33 @@ until the step ends.
 inside a container; once the volume is populated it can be mounted read-only
 everywhere else. Re-running only re-does the hash check.
 
+### Volumes: `commit()` is only half of it
+
+**Every step must `commit()` at the end**, and periodically inside long ones.
+Writes are not durable to other containers until committed.
+
+**Every reader must `reload()` before reading what another container wrote.**
+[verified 2026-10-07] This is the half that is easy to miss, and missing it is
+silent. `commit()` makes a write durable; it does **not** push it into a
+container that is already running. A long-lived container therefore keeps
+whatever view of the volume it had at startup.
+
+The first full end-to-end run hit exactly this. `orchestrate` is long-lived, so
+after `filter_designs` committed three passing shards it still saw an empty
+directory, reported `n_passing_backbone_filters: 0`, skipped MPNN and **exited
+0**. The reducer -- a fresh container -- read the same shards and reported 3.
+Two numbers in one report that could not both be true.
+
+The tell is a disagreement like that, or a step reporting zero inputs. It never
+raises. Note also that it is unreachable via `--start-at`, because that
+`orchestrate` container starts *after* the shards exist: only a continuous run
+exposes it.
+
+Fresh containers see everything, so `filter_designs`, `run_mpnn` and
+`reduce_summaries` are correct today without it. They call `reload()` anyway,
+because Modal may reuse a container across `.map()` inputs and a stale view
+reads as "missing input" rather than as an error.
+
 **The Anthropic `af3_jax` kit ships OpenFold3 *ported* weights (`--variant p2`),
 not official AF3 weights** (`af3_jax/README.md:4`). [verified 2026-09-28]
 Commercially relevant: the official weights carry a non-commercial restriction.

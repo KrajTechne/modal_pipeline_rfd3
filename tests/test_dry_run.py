@@ -20,10 +20,10 @@ class TestScaleReduction:
         assert len(raw["rfdiffusion3"]["specs"]) == 2
         assert [s.name for s in dry.rfdiffusion3.specs] == ["rgd_core"]
 
-    def test_designs_drop_to_two(self, raw, dry):
+    def test_designs_drop_to_three(self, raw, dry):
         full = CampaignConfig.model_validate(raw)
         assert full.rfdiffusion3.total_designs == 80
-        assert dry.rfdiffusion3.total_designs == 2
+        assert dry.rfdiffusion3.total_designs == 3
 
     def test_cheapest_folding_configuration(self, dry):
         assert dry.refolding.model.value == "esmfold2"
@@ -69,7 +69,7 @@ class TestItCannotBeMistakenForARealRun:
         banner = dry_run_banner(dry)
         assert "DRY RUN" in banner
         assert "alphav_beta3_01-dryrun" in banner
-        assert "designs  : 2" in banner
+        assert "designs  : 3" in banner
         assert "--dry-run" in banner
 
 

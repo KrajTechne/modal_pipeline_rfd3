@@ -309,6 +309,10 @@ def run_mpnn(design_ids: list[str], campaign_payload: dict) -> dict:
 
     from rfd3_pipeline.report import read_shards, write_shard
 
+    # Same reason as in `filter_designs`: the shards and the designs this reads
+    # were written by other containers.
+    data_volume.reload()
+
     campaign = _campaign_from(campaign_payload)
     mpnn = campaign.mpnn
     binder = campaign.general.chain_binder
@@ -530,6 +534,11 @@ def filter_designs(design_ids: list[str], campaign_payload: dict) -> dict:
     out_dir = root / "rfd3" / "out"
     shards = root / "shards"
 
+    # The designs were written by other containers. A fresh container sees them,
+    # but Modal may reuse one across map inputs, and a stale view reads as
+    # "missing design" rather than as an error.
+    data_volume.reload()
+
     resolved = resolve_campaign(campaign, structure_root=DATA)
     by_name = {spec.name: spec for spec in resolved.specs}
     binder = campaign.general.chain_binder
@@ -581,6 +590,9 @@ def reduce_summaries(campaign_payload: dict) -> dict:
 
     from rfd3_pipeline.gates import Stage, backbone_gates
     from rfd3_pipeline.report import latest_records, read_shards, write_summaries
+
+    # Every shard was written by some other container.
+    data_volume.reload()
 
     campaign = _campaign_from(campaign_payload)
     root = Path(_run_root(campaign))
@@ -654,6 +666,7 @@ def orchestrate(campaign_payload: dict, start_at: str = "rfd3", chunk_size: int 
         report["rfd3"] = rfd3_results
         designs = [d for result in rfd3_results for d in result["designs"]]
     else:
+        data_volume.reload()
         designs = sorted(p.stem for p in (root / "rfd3" / "out").glob("*.json"))
     report["n_designs"] = len(designs)
     print(f"phase rfd3 done: {len(designs)} designs", flush=True)
@@ -668,6 +681,14 @@ def orchestrate(campaign_payload: dict, start_at: str = "rfd3", chunk_size: int 
     # Only backbones that passed go to MPNN. The verdict lives in the shards
     # rather than in the filter step's return value, so that restarting at
     # `mpnn` selects exactly the same set as a continuous run would.
+    #
+    # `reload()` is not optional, and its absence is silent. This container is
+    # long-lived, so its view of the volume is whatever it was when the
+    # container started; the filter containers' `commit()` makes their shards
+    # durable but does not push them into an already-running reader. Without
+    # this, the first end-to-end run found zero passing designs, skipped MPNN
+    # and exited 0, while the reducer -- a fresh container -- saw all three.
+    data_volume.reload()
     passing = _passing_designs(root)
     report["n_passing_backbone_filters"] = len(passing)
     chunks = chunked(passing)
