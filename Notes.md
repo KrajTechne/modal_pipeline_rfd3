@@ -327,9 +327,10 @@ sequences. Do not add a third representation of the same relation.
 ## 8. Stages not built yet (apo/holo refolding, cross-validation)
 
 Recorded now because the traps are already known and all are the silent kind.
-All **[verified 2026-09-28]** against upstream source, not docs. Re-check if
-those repos move. The first of these is where the egress trap below starts to
-matter, so it is worth reading before that stage is written rather than after.
+Verified against upstream source rather than docs, dated per item -- most on
+2026-09-28, the `msa_server.py` mechanics on 2026-10-07. Re-check if those repos
+move. Worth reading *before* the apo stage is written rather than after: the
+egress trap below is the reason this section exists.
 
 **`sokrypton/alphafold3 --use_msa_server` does not cache, despite its help text
 saying results are cached in `--cache_dir`.** `run_alphafold.py:1728` calls
@@ -338,11 +339,99 @@ the JAX compile and tokamax autotune cache. Leaving it on would **POST every
 designed binder sequence to api.colabfold.com**, once per prediction. This is
 the data-egress trap, not a performance one.
 
-**`fill_missing_msas` only skips chains whose MSA is already set**
-(`msa_server.py:195,243`). A binder left at `None` is batched into both the
-unpaired and the paired query, because it counts toward `unique_protein_seqs`
-(`:211-215`). The binder needs `unpaired_msa=">query\n<seq>\n"` and
-`paired_msa=""` set **explicitly**.
+### Which models need an MSA at all
+
+Before any of the MSA machinery matters, check the model. The table is
+`MODEL_CAPABILITIES` in `config.py` -- one row per model, no scattered
+conditionals, and a missing field is a `KeyError` at import rather than a silent
+fall-through. As of 2026-10-07:
+
+| model | consumes_msa | templates | seeds | weights | variant (no-msa / msa) |
+|---|---|---|---|---|---|
+| `esmfold2` | **yes** | no | `--seeds a,b,c` | -- | `full_nomsa` / `full_msa` |
+| `esmfold2-fast` | **no** | no | `--seeds a,b,c` | -- | `fast` / `fast` |
+| `boltz2` | **yes** | no *[unconfirmed]* | `--seeds a,b,c` | -- | none / none |
+| `af3_jax` | **yes** | yes | `--num_seeds N` | `openfold3` | `p2` / `p2` |
+
+**On `esmfold2-fast` there is no MSA step and no egress risk** -- nothing below
+is reachable. Apo and holo then differ only by which chains are in the input.
+Everything below goes live the moment the model changes.
+
+**The kit `--config` card is a function of the GPU, not the model.** `GPU_TO_CARD`
+maps `A100`/`A100-40GB`/`A100-80GB` -> `a100`, `H100` -> `h100`, `H200` -> `h200`.
+`Mode` (`off|exact|fast|big`) is configured per step. Three independent axes --
+model capabilities, GPU card, acceleration mode -- so do not merge them into one
+table.
+
+`boltz2` is the least-specified row: `consumes_msa` is true but it has neither a
+derived nor a fixed variant, and its template support is held false
+deliberately. Verify that row against source before trusting it.
+
+### Suppressing the binder's MSA takes *two* fields, not one
+
+[verified 2026-10-07 against `msa_server.py`, read at `main`]
+
+`fill_missing_msas` runs two independent queries, gated on **different** fields:
+
+```python
+# :195  unpaired query -- gated on unpaired_msa
+if chain.unpaired_msa is None and chain.sequence not in protein_seqs_needing_msa:
+
+# :212  paired query -- gated on paired_msa, separately
+c.sequence for c in protein_chains if c.paired_msa is None
+# :215
+if len(unique_protein_seqs) > 1:
+    _query_server(unique_protein_seqs, use_pairing=True, ...)
+```
+
+| set on the binder | unpaired query | paired query | binder sequence leaves? |
+|---|---|---|---|
+| nothing | included | included | **yes, twice** |
+| `unpaired_msa` only | excluded | **still included** | **yes, via pairing** |
+| `unpaired_msa` + `paired_msa=""` | excluded | excluded | no |
+
+**The middle row is the trap.** Suppressing the unpaired MSA does not keep the
+binder out of the paired query; that is a separate gate on a separate field.
+`""` counts as set, since the check is `is None`, so empty string is a valid
+suppression value.
+
+**A paired MSA is generated per chain, for every chain in the query** -- the
+binder included, if not suppressed. The query goes out once with all
+unsuppressed chains and the results are zipped back per sequence and assigned
+individually (`:246`).
+
+That matters beyond egress. Pairing keeps only species present across *all*
+queried chains, so including a homolog-free de novo binder should collapse the
+paired MSA for the **targets** as well, not merely yield an empty one for the
+binder. The per-chain generation is verified in the source; the
+intersection-by-taxonomy behaviour is standard ColabFold pairing semantics,
+server-side, and is **[unconfirmed]** here. Either way, suppressing the binder
+protects target pairing depth as well as keeping the sequence in-house.
+
+### Two further quirks in that function
+
+**The paired query needs more than one unsuppressed chain** (`:215`). With a
+single target, pairing never fires and that chain's `paired_msa` falls back to
+`''` (`:246`) -- no paired MSA at all, by omission rather than by decision.
+
+**Identical target sequences collapse to one.** `dict.fromkeys` dedupes by
+sequence, so a homodimer target gives `len == 1` and pairing is skipped
+entirely. This is the mechanism behind the standing note that sequence identity
+between target chains is a runtime question affecting MSA pairing alone.
+
+**The early return discards paired results it has already paid for.** `:235`
+checks only `protein_seqs_needing_msa`, the *unpaired* list:
+
+```python
+if not protein_seqs_needing_msa and not rna_needing_stub:
+    return fold_input
+```
+
+The paired query at `:215` has already run by then. So setting `unpaired_msa`
+everywhere while leaving `paired_msa` as `None` fires the paired query, sends
+the sequences, then returns early and **throws the answer away**. The egress is
+paid and nothing is gained -- the strongest reason to set both fields on every
+chain rather than relying on the unpaired gate.
 
 **Optimus `mmseqs2.py` has a colliding cache key.** It keys on
 `f"{prefix}_{mode}"` (`:179`) and `generate_msa` passes the caller's `msa_dir`
@@ -354,12 +443,14 @@ large tarball.
 an explicit `--seeds a,b,c`; the AF3 fork takes `--num_seeds N` and *generates*
 the seeds, so the ones actually used are readable only from its output JSON.
 
-**boltz2 template support is unconfirmed.** Held as
-`supports_templates=False` in the capability table deliberately, so a campaign
-cannot silently request something that may be ignored. **[unconfirmed]**
-
 **Refolding models that do not read MSAs** still get the cached target MSA
-built; resolution emits a warning rather than skipping the work.
+built; resolution emits a warning rather than skipping the work. On
+`esmfold2-fast` that warning is the signal that the whole cache step is dead
+weight for the campaign, not a problem to fix.
+
+**`supports_templates=False` for boltz2 is a deliberate false, not a measured
+one** -- held that way so a campaign cannot silently request something that may
+be ignored. See the table above.
 
 ---
 
