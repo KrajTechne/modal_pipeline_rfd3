@@ -48,6 +48,7 @@ PROJECT_DEPS = ("numpy>=1.26", "biotite>=1.0", "pyyaml>=6.0", "pydantic>=2.0")
 cpu_image = (
     modal.Image.debian_slim(python_version="3.12")
     .pip_install(*PROJECT_DEPS)
+    .env({"PYTHONUNBUFFERED": "1"})
     .add_local_python_source("rfd3_pipeline")
 )
 
@@ -58,11 +59,63 @@ rfd3_image = (
     .apt_install("git", "build-essential")
     .pip_install("rc-foundry[rfd3]==0.2.0")
     .pip_install(*PROJECT_DEPS)
-    .env({"FOUNDRY_CHECKPOINT_DIRS": RFD3_CHECKPOINTS, "MODEL_OPT_JIT_ROOT": JIT})
+    .env(
+        {
+            "FOUNDRY_CHECKPOINT_DIRS": RFD3_CHECKPOINTS,
+            "MODEL_OPT_JIT_ROOT": JIT,
+            # Without this, a child process's output sits in its pipe buffer and
+            # the log view stays empty until the step ends.
+            "PYTHONUNBUFFERED": "1",
+        }
+    )
     .add_local_python_source("rfd3_pipeline")
 )
 
 HOUR = 60 * 60
+
+
+def _stream(
+    command: list[str],
+    *,
+    timeout: int,
+    cwd: str | None = None,
+    tail_lines: int = 60,
+) -> tuple[int, str]:
+    """Run a command, echoing its output so the Modal log view shows progress.
+
+    `capture_output=True` holds every line in a pipe until the process exits,
+    which on a six-hour design job leaves no way to tell a slow run from a hung
+    one. Lines are printed as they arrive; a bounded tail is still returned for
+    the report. stderr is merged into stdout to keep the interleaving the
+    subprocess intended.
+    """
+    import subprocess
+    import threading
+    from collections import deque
+
+    tail: deque[str] = deque(maxlen=tail_lines)
+    process = subprocess.Popen(
+        command,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        bufsize=1,
+        cwd=cwd,
+    )
+    # A watchdog rather than a deadline checked per line, so a process that
+    # hangs while printing nothing is still killed.
+    watchdog = threading.Timer(timeout, process.kill)
+    watchdog.start()
+    try:
+        for line in process.stdout or ():
+            line = line.rstrip()
+            tail.append(line)
+            print(line, flush=True)
+    finally:
+        watchdog.cancel()
+        if process.stdout is not None:
+            process.stdout.close()
+    return process.wait(), "\n".join(tail)
 
 
 def _campaign_from(payload: dict):
@@ -87,15 +140,12 @@ def populate_weights() -> dict:
     Its own function rather than a side effect of a step, because the installers
     run inside containers and the volume is then mountable read-only.
     """
-    import subprocess
     from pathlib import Path
 
     target = Path(RFD3_CHECKPOINTS)
     target.mkdir(parents=True, exist_ok=True)
-    result = subprocess.run(
+    returncode, output_tail = _stream(
         ["foundry", "install", "rfd3", "--checkpoint-dir", RFD3_CHECKPOINTS],
-        capture_output=True,
-        text=True,
         timeout=2 * HOUR,
     )
     weights_volume.commit()
@@ -106,9 +156,9 @@ def populate_weights() -> dict:
         if p.is_file()
     )
     return {
-        "returncode": int(result.returncode),
+        "returncode": returncode,
         "files": files,
-        "stderr_tail": str(result.stderr or "")[-1000:],
+        "output_tail": output_tail,
     }
 
 
@@ -126,7 +176,6 @@ def run_rfd3(spec_name: str, campaign_payload: dict) -> dict:
     pairing as "(pipelines usage)". `skip_existing` stays on, so a preempted
     container regenerates only what is missing.
     """
-    import subprocess
     from pathlib import Path
 
     campaign = _campaign_from(campaign_payload)
@@ -151,18 +200,18 @@ def run_rfd3(spec_name: str, campaign_payload: dict) -> dict:
         "skip_existing=True",
         "dump_prediction_metadata_json=True",
     ]
-    result = subprocess.run(
-        command, capture_output=True, text=True, cwd=str(root), timeout=6 * HOUR
-    )
+    print(f"rfd3 design: spec {spec_name} in {root}", flush=True)
+    returncode, output_tail = _stream(command, timeout=6 * HOUR, cwd=str(root))
     data_volume.commit()
 
     designs = sorted(p.stem for p in out_dir.glob(f"*{spec_name}*.json"))
+    print(f"rfd3 design: spec {spec_name} exit {returncode}, {len(designs)} designs", flush=True)
     return {
         "spec_name": spec_name,
-        "returncode": int(result.returncode),
+        "returncode": returncode,
         "n_designs": len(designs),
         "designs": designs,
-        "stderr_tail": str(result.stderr or "")[-2000:],
+        "output_tail": output_tail,
     }
 
 
@@ -279,8 +328,11 @@ def orchestrate(campaign_payload: dict, start_at: str = "rfd3", chunk_size: int 
     rfd3 = campaign.rfdiffusion3
     report: dict[str, object] = {"start_at": start_at}
 
+    print(f"orchestrate: start_at={start_at}, {len(rfd3.specs)} spec(s)", flush=True)
+
     if start_at == "rfd3":
         spec_names = [spec.name for spec in rfd3.specs]
+        print(f"phase rfd3: fanning out to {spec_names}", flush=True)
         rfd3_results = list(
             run_rfd3.map(spec_names, kwargs={"campaign_payload": campaign_payload})
         )
@@ -292,13 +344,17 @@ def orchestrate(campaign_payload: dict, start_at: str = "rfd3", chunk_size: int 
         out_dir = Path(_run_root(campaign)) / "rfd3" / "out"
         designs = sorted(p.stem for p in out_dir.glob("*.json"))
     report["n_designs"] = len(designs)
+    print(f"phase rfd3 done: {len(designs)} designs", flush=True)
 
     chunks = [designs[i : i + chunk_size] for i in range(0, len(designs), chunk_size)]
+    print(f"phase filter: {len(chunks)} chunk(s) of up to {chunk_size}", flush=True)
     report["backbone_filters"] = list(
         filter_designs.map(chunks, kwargs={"campaign_payload": campaign_payload})
     )
 
+    print("phase reduce", flush=True)
     report["reduce"] = reduce_summaries.remote(campaign_payload)
+    print("orchestrate: done", flush=True)
     return report
 
 
@@ -341,7 +397,12 @@ def _prepare(campaign_path: str, dry_run: bool = False) -> tuple[dict, str, str]
 
     with data_volume.batch_upload(force=True) as upload:
         upload.put_file(repo / structure, structure)
-        upload.put_file(io_bytes(dump_rfd3_specs(resolved)), f"{remote_root}/rfd3/specs.yaml")
+        # The container path, not the client one: RFD3 resolves a relative
+        # `input` against the specs file's own directory.
+        upload.put_file(
+            io_bytes(dump_rfd3_specs(resolved, input_path=f"{DATA}/{structure}")),
+            f"{remote_root}/rfd3/specs.yaml",
+        )
         upload.put_file(
             io_bytes(yaml.safe_dump(resolved.to_dict(), sort_keys=False)),
             f"{remote_root}/campaign.resolved.yaml",

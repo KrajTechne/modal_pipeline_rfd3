@@ -3,6 +3,8 @@ from __future__ import annotations
 import copy
 
 import pytest
+import pathlib
+
 import yaml
 from conftest import REPO_ROOT, build, with_contig, with_specs
 
@@ -200,6 +202,27 @@ class TestSpecEmission:
         entry = build_rfd3_specs(resolve(merged, alphav_structure))["rgd_core"]
         assert "ligand" not in entry
         assert "is_non_loopy" not in entry
+
+    def test_input_path_override_is_emitted_on_every_key(self, resolved):
+        """RFD3 resolves a relative `input` against the specs file's directory,
+        so the remote absolute path has to be injectable."""
+        specs = build_rfd3_specs(resolved, input_path="/data/inputs/target.pdb")
+        assert [e["input"] for e in specs.values()] == ["/data/inputs/target.pdb"] * 2
+
+    def test_input_path_override_survives_the_yaml_dump(self, resolved):
+        text = dump_rfd3_specs(resolved, input_path="/data/inputs/target.pdb")
+        for entry in yaml.safe_load(text).values():
+            assert entry["input"] == "/data/inputs/target.pdb"
+
+    def test_input_path_accepts_a_path_object(self, resolved):
+        specs = build_rfd3_specs(resolved, input_path=pathlib.PurePosixPath("/d/t.pdb"))
+        assert specs["rgd_core"]["input"] == "/d/t.pdb"
+        assert isinstance(specs["rgd_core"]["input"], str), "must dump as a plain scalar"
+
+    def test_campaign_relative_path_kept_when_no_override(self, resolved):
+        """The default must stay usable for a local run from the repo root."""
+        entry = build_rfd3_specs(resolved)["rgd_core"]
+        assert entry["input"] == resolved.config.rfdiffusion3.path_input_structure
 
     def test_round_trips_through_yaml(self, resolved):
         assert yaml.safe_load(dump_rfd3_specs(resolved)) == build_rfd3_specs(resolved)

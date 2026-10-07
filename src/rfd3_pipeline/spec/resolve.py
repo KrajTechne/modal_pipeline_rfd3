@@ -375,18 +375,31 @@ def resolve_campaign(
     )
 
 
-def build_rfd3_specs(resolved: ResolvedCampaign) -> dict[str, dict]:
+def build_rfd3_specs(
+    resolved: ResolvedCampaign, input_path: str | Path | None = None
+) -> dict[str, dict]:
     """The RFD3 input mapping: one key per spec, shared fields copied onto each.
 
     `length` is deliberately omitted. It is optional when a contig is present,
     it constrains the contig rather than the whole system, and emitting a derived
     copy of information the contig already carries just creates a second value to
     keep in sync. `ResolvedSpec.length` keeps it for assertions and reporting.
+
+    Args:
+        resolved: the resolved campaign.
+        input_path: what to write as `input`. RFD3 resolves a relative `input`
+            against the directory holding the specs file, not the working
+            directory, so a campaign-relative path silently becomes
+            `<run>/rfd3/<campaign-relative path>` and the design fails with
+            `FileNotFoundError`. Callers running RFD3 elsewhere than the repo --
+            which on Modal is every caller -- must pass the absolute path the
+            structure will have *there*. `ResolvedCampaign.structure_path` is
+            not usable for this: it is resolved against the client's filesystem.
     """
     rfd3 = resolved.config.rfdiffusion3
 
     shared: dict[str, object] = {
-        "input": rfd3.path_input_structure,
+        "input": str(input_path) if input_path is not None else rfd3.path_input_structure,
         "dialect": rfd3.dialect,
         "infer_ori_strategy": rfd3.infer_ori_strategy,
     }
@@ -409,8 +422,12 @@ def build_rfd3_specs(resolved: ResolvedCampaign) -> dict[str, dict]:
     return specs
 
 
-def dump_rfd3_specs(resolved: ResolvedCampaign) -> str:
+def dump_rfd3_specs(
+    resolved: ResolvedCampaign, input_path: str | Path | None = None
+) -> str:
     """`build_rfd3_specs` as the YAML handed to `rfd3 design inputs=...`."""
     return yaml.safe_dump(
-        build_rfd3_specs(resolved), sort_keys=False, default_flow_style=False
+        build_rfd3_specs(resolved, input_path),
+        sort_keys=False,
+        default_flow_style=False,
     )
