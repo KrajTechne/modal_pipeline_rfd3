@@ -22,6 +22,7 @@ __all__ = [
     "build_summary_csv",
     "build_summary_json",
     "order_columns",
+    "latest_records",
     "read_shards",
     "write_shard",
     "write_summaries",
@@ -179,6 +180,38 @@ def build_summary_json(
         if any(r.get("stage_reached") == stage for r in records)
     }
     return counts
+
+
+def latest_records(
+    records: Sequence[Mapping[str, object]],
+) -> list[dict]:
+    """One row per sequence, plus one per backbone that never got that far.
+
+    A design's backbone shard and its sequence shards describe the same design
+    at different stages, and the sequence records carry the backbone's `bb_*`
+    columns forward. Keeping both would double count: a passing backbone would
+    appear once as itself and once per sequence, so `summary.csv` would mix
+    granularities and any `bb_pass` tally would be inflated by the number of
+    sequences.
+
+    The backbone record is therefore dropped once sequences exist for that
+    design, and kept otherwise -- which is exactly the set the plan describes,
+    since a backbone that failed the filters never reaches MPNN and stays its
+    own terminal row.
+
+    The shards themselves are left alone, so restarting at `mpnn` still sees
+    every backbone verdict.
+    """
+    superseded = {
+        record.get("design_id")
+        for record in records
+        if record.get("seq_id") and record.get("design_id")
+    }
+    return [
+        dict(record)
+        for record in records
+        if record.get("seq_id") or record.get("design_id") not in superseded
+    ]
 
 
 def write_summaries(

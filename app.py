@@ -20,6 +20,8 @@ Two rules the whole file follows, both learned the hard way:
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import modal
 
 APP_NAME = "rfd3-pipeline"
@@ -36,6 +38,7 @@ DATA = "/data"
 WEIGHTS = "/weights"
 JIT = "/jit"
 RFD3_CHECKPOINTS = f"{WEIGHTS}/rfd3"
+MPNN_CHECKPOINTS = f"{WEIGHTS}/ligandmpnn"
 
 VOLUMES = {DATA: data_volume, WEIGHTS: weights_volume, JIT: jit_volume}
 
@@ -70,6 +73,42 @@ rfd3_image = (
     )
     .add_local_python_source("rfd3_pipeline")
 )
+
+# LigandMPNN. Vendored at `LigandMPNN/` rather than cloned, because its bundled
+# openfold used numpy aliases removed in 1.24 and upstream therefore pins
+# numpy==1.23.5 -- which has no cp312 wheels. With those six occurrences fixed
+# in the vendored copy it runs on 3.12 with numpy 2.x, so it shares one image
+# with the project's own code instead of needing a container of its own.
+# `requirements.txt` is deliberately not installed: it would drag numpy 1.23.5
+# back and pin torch to 2.2.1.
+MPNN_CHECKOUT = "/opt/LigandMPNN"
+MPNN_DEPS = ("prody", "ml-collections", "dm-tree", "scipy", "biopython")
+
+mpnn_image = (
+    modal.Image.debian_slim(python_version="3.12")
+    .apt_install("wget")
+    .pip_install("torch")
+    .pip_install(*MPNN_DEPS)
+    .pip_install(*PROJECT_DEPS)
+    .env({"PYTHONUNBUFFERED": "1"})
+    # copy=True: a copy=False local source may not be followed by further build
+    # steps, and `add_local_python_source` has to come last.
+    .add_local_dir(
+        Path(__file__).resolve().parent / "LigandMPNN",
+        MPNN_CHECKOUT,
+        copy=True,
+        ignore=["__pycache__", "*.pyc"],
+    )
+    .add_local_python_source("rfd3_pipeline")
+)
+
+# `mpnn_type` -> (run.py --model_type, its checkpoint flag, the checkpoint file).
+# The flag differs per model type, so it cannot be derived from the name.
+MPNN_MODELS = {
+    "soluble": ("soluble_mpnn", "--checkpoint_soluble_mpnn", "solublempnn_v_48_020.pt"),
+    "protein": ("protein_mpnn", "--checkpoint_protein_mpnn", "proteinmpnn_v_48_020.pt"),
+    "ligand": ("ligand_mpnn", "--checkpoint_ligand_mpnn", "ligandmpnn_v_32_010_25.pt"),
+}
 
 HOUR = 60 * 60
 
@@ -216,6 +255,254 @@ def run_rfd3(spec_name: str, campaign_payload: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# MPNN
+# ---------------------------------------------------------------------------
+@app.function(image=mpnn_image, volumes=VOLUMES, timeout=HOUR)
+def populate_mpnn_weights() -> dict:
+    """Download the MPNN checkpoints into the weights volume.
+
+    Separate from `populate_weights` because it is a different image and a
+    different installer, and because a campaign that never runs MPNN should not
+    pay for it. All 15 checkpoints are 123 MB together, so re-fetching is cheap
+    enough that no hash-check dance is warranted.
+    """
+    target = Path(MPNN_CHECKPOINTS)
+    target.mkdir(parents=True, exist_ok=True)
+
+    # The script takes its destination as $1.
+    returncode, output_tail = _stream(
+        ["bash", f"{MPNN_CHECKOUT}/get_model_params.sh", str(target)], timeout=HOUR
+    )
+    weights_volume.commit()
+
+    landed = sorted(
+        (str(f.relative_to(target)), int(f.stat().st_size))
+        for f in target.rglob("*")
+        if f.is_file()
+    )
+    return {
+        "returncode": returncode,
+        "files": landed,
+        # `wget -q` leaves a zero-byte file behind on failure rather than
+        # erroring, so an empty checkpoint would otherwise surface only as a
+        # torch.load failure inside the GPU step.
+        "empty_files": [name for name, size in landed if size == 0],
+        "output_tail": output_tail,
+    }
+
+
+@app.function(image=mpnn_image, gpu="L40S", volumes=VOLUMES, timeout=2 * HOUR)
+def run_mpnn(design_ids: list[str], campaign_payload: dict) -> dict:
+    """Design sequences for a chunk of backbones, writing one shard per sequence.
+
+    Chunked like `filter_designs`, and for a stronger reason: MPNN is ~7.5 s for
+    eight sequences over a 520-residue system, most of it loading the model, so
+    a container per design would be almost all startup. `--pdb_path_multi` and
+    `--fixed_residues_multi` take JSON maps, so a whole chunk runs in one
+    invocation with per-design fixed residues.
+    """
+    import gzip
+    import json
+    import shutil
+
+    import prody
+
+    from rfd3_pipeline.report import read_shards, write_shard
+
+    campaign = _campaign_from(campaign_payload)
+    mpnn = campaign.mpnn
+    binder = campaign.general.chain_binder
+    root = Path(_run_root(campaign))
+    designs_dir = root / "rfd3" / "out"
+    shards = root / "shards"
+    work = Path("/tmp/mpnn")
+    work.mkdir(parents=True, exist_ok=True)
+
+    model_type, checkpoint_flag, checkpoint_file = MPNN_MODELS[mpnn.mpnn_type.value]
+    checkpoint = Path(MPNN_CHECKPOINTS) / checkpoint_file
+    if not checkpoint.exists():
+        raise FileNotFoundError(
+            f"{checkpoint} missing; run `modal run app.py::install_mpnn_weights` first"
+        )
+
+    # Each design's fixed residues come from its own shard, which is where the
+    # backbone filters recorded them. Re-deriving them here would be a second
+    # implementation of the numbering, and the reason it lives in exactly one
+    # place is that input-vs-output numbering fails silently rather than loudly.
+    by_design = {
+        record["design_id"]: record
+        for record in read_shards(shards)
+        if record.get("design_id") and not record.get("seq_id")
+    }
+
+    # run.py wants PDB; RFD3 writes gzipped mmCIF. ProDy is MPNN's own parser,
+    # so converting with it keeps one opinion about the structure rather than
+    # introducing biotite's as a second.
+    pdb_paths: dict[str, str] = {}
+    fixed: dict[str, str] = {}
+    prepared: list[str] = []
+    skipped: list[dict] = []
+    for design_id in design_ids:
+        record = by_design.get(design_id)
+        if record is None:
+            skipped.append({"design_id": design_id, "reason": "no backbone shard"})
+            continue
+        residues = record.get("mpnn_fixed_residues")
+        if not residues:
+            skipped.append({"design_id": design_id, "reason": "no mpnn_fixed_residues"})
+            continue
+        source = designs_dir / f"{design_id}.cif.gz"
+        if not source.exists():
+            skipped.append({"design_id": design_id, "reason": "missing cif.gz"})
+            continue
+
+        plain = work / f"{design_id}.cif"
+        with gzip.open(source, "rb") as src, plain.open("wb") as dst:
+            shutil.copyfileobj(src, dst)
+        parsed = prody.parseMMCIF(str(plain))
+        if parsed is None:
+            skipped.append({"design_id": design_id, "reason": "prody parse returned None"})
+            continue
+
+        as_pdb = work / f"{design_id}.pdb"
+        prody.writePDB(str(as_pdb), parsed)
+        # Only the keys are read from the pdb map; the values are ignored.
+        pdb_paths[str(as_pdb)] = ""
+        fixed[str(as_pdb)] = str(residues)
+        prepared.append(design_id)
+
+    if not prepared:
+        return {"returncode": 0, "n_sequences": 0, "designs": [], "skipped": skipped}
+
+    multi_pdb = work / "pdbs.json"
+    multi_fixed = work / "fixed.json"
+    multi_pdb.write_text(json.dumps(pdb_paths))
+    multi_fixed.write_text(json.dumps(fixed))
+
+    out_folder = work / "out"
+    command = [
+        "python", "run.py",
+        "--model_type", model_type,
+        checkpoint_flag, str(checkpoint),
+        "--pdb_path_multi", str(multi_pdb),
+        "--fixed_residues_multi", str(multi_fixed),
+        "--out_folder", str(out_folder),
+        # Without this, MPNN designs EVERY chain: it invents new target
+        # sequences and optimises the binder against them. It does not error --
+        # it returns plausible sequences for a target that does not exist.
+        # Verified 2026-10-07 by diffing the target segments against the native.
+        "--chains_to_design", binder,
+        "--temperature", str(mpnn.mpnn_sampling_temp),
+        "--batch_size", str(mpnn.num_seqs),
+        "--number_of_batches", "1",
+        "--omit_AA", mpnn.rm_aa,
+        # One base seed for the campaign, so a re-run is comparable to its
+        # original. MPNN takes a single `--seed`, not a list.
+        "--seed", str(campaign.general.base_seed),
+    ]
+    print(f"mpnn: {len(prepared)} design(s), model {model_type}", flush=True)
+    returncode, output_tail = _stream(command, timeout=2 * HOUR, cwd=MPNN_CHECKOUT)
+
+    written: list[str] = []
+    if returncode == 0:
+        for design_id in prepared:
+            fasta = out_folder / "seqs" / f"{design_id}.fa"
+            if not fasta.exists():
+                skipped.append({"design_id": design_id, "reason": "no fasta produced"})
+                continue
+            for record in _mpnn_records(
+                fasta.read_text(), design_id, by_design[design_id], mpnn
+            ):
+                write_shard(record, shards)
+                written.append(record["seq_id"])
+
+    data_volume.commit()
+    print(f"mpnn: exit {returncode}, {len(written)} sequence(s)", flush=True)
+    return {
+        "returncode": returncode,
+        "n_sequences": len(written),
+        "designs": prepared,
+        "skipped": skipped,
+        "output_tail": output_tail,
+    }
+
+
+def _mpnn_records(text: str, design_id: str, backbone: dict, mpnn) -> list[dict]:
+    """One record per designed sequence, parsed out of MPNN's FASTA.
+
+    The format, verified against real output on 2026-10-07: the **first** record
+    is the input sequence rather than a design, so designs start at index 1.
+    Chains are joined by `--fasta_seq_separation` (`:` by default) and the
+    binder is the first segment, since it is chain A. Each design's header
+    carries `id`, `T`, `seed`, `overall_confidence`, `ligand_confidence` and
+    `seq_rec`.
+
+    The backbone record is carried forward so a sequence row in `summary.csv`
+    keeps its design's `bb_*` columns; later stages are stripped in case this is
+    a re-run over shards that already have them.
+    """
+    from rfd3_pipeline.gates import Stage
+
+    entries: list[tuple[str, str]] = []
+    header: str | None = None
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        if line.startswith(">"):
+            header = line[1:]
+        elif header is not None:
+            entries.append((header, line))
+            header = None
+
+    records: list[dict] = []
+    for index, (head, sequence) in enumerate(entries[1:], start=1):
+        meta: dict[str, str] = {}
+        for field in head.split(","):
+            key, sep, value = field.partition("=")
+            if sep:
+                meta[key.strip()] = value.strip()
+
+        binder_sequence = sequence.split(":")[0]
+        record = {
+            key: value
+            for key, value in backbone.items()
+            if not key.startswith(("apo_", "holo_", "cv_", "rank_", "cluster_"))
+        }
+        record.update(
+            {
+                "seq_id": f"{design_id}_seq{index}",
+                "design_id": design_id,
+                "mpnn_index": index,
+                "stage_reached": Stage.MPNN,
+                "sequence": binder_sequence,
+                "seq_length": len(binder_sequence),
+                "mpnn_temp": _as_float(meta.get("T")) or mpnn.mpnn_sampling_temp,
+                "mpnn_seed": _as_int(meta.get("seed")),
+                "mpnn_overall_confidence": _as_float(meta.get("overall_confidence")),
+                "mpnn_ligand_confidence": _as_float(meta.get("ligand_confidence")),
+                "mpnn_seq_rec": _as_float(meta.get("seq_rec")),
+            }
+        )
+        records.append(record)
+    return records
+
+
+def _as_float(value):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _as_int(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Backbone filters
 # ---------------------------------------------------------------------------
 @app.function(image=cpu_image, cpu=4.0, memory=16384, volumes=VOLUMES, timeout=2 * HOUR)
@@ -287,11 +574,14 @@ def reduce_summaries(campaign_payload: dict) -> dict:
     from pathlib import Path
 
     from rfd3_pipeline.gates import Stage, backbone_gates
-    from rfd3_pipeline.report import read_shards, write_summaries
+    from rfd3_pipeline.report import latest_records, read_shards, write_summaries
 
     campaign = _campaign_from(campaign_payload)
     root = Path(_run_root(campaign))
-    records = read_shards(root / "shards")
+    shards = read_shards(root / "shards")
+    # One row per sequence, plus the backbones that died before MPNN. Without
+    # this a passing backbone is counted once as itself and again per sequence.
+    records = latest_records(shards)
 
     paths = write_summaries(
         root,
@@ -304,7 +594,15 @@ def reduce_summaries(campaign_payload: dict) -> dict:
     )
     data_volume.commit()
 
-    passing = sum(1 for r in records if r.get("bb_pass") is True)
+    # Distinct designs, not rows: a passing backbone with eight sequences is
+    # one design that passed, not eight.
+    passing = len(
+        {
+            r.get("design_id")
+            for r in records
+            if r.get("bb_pass") is True and r.get("design_id")
+        }
+    )
     return {
         "n_records": len(records),
         "n_passing_backbone_filters": passing,
@@ -324,13 +622,24 @@ def orchestrate(campaign_payload: dict, start_at: str = "rfd3", chunk_size: int 
     `modal run --detach` only keeps already-dispatched functions alive, not the
     coordination between them.
     """
+    from rfd3_pipeline.gates import Stage
+
     campaign = _campaign_from(campaign_payload)
     rfd3 = campaign.rfdiffusion3
     report: dict[str, object] = {"start_at": start_at}
 
     print(f"orchestrate: start_at={start_at}, {len(rfd3.specs)} spec(s)", flush=True)
 
-    if start_at == "rfd3":
+    root = Path(_run_root(campaign))
+    stages = Stage.ORDER[: Stage.ORDER.index(Stage.MPNN) + 1]
+    if start_at not in stages:
+        raise ValueError(f"start_at must be one of {list(stages)}, got {start_at!r}")
+    reached = stages.index(start_at)
+
+    def chunked(items: list[str]) -> list[list[str]]:
+        return [items[i : i + chunk_size] for i in range(0, len(items), chunk_size)]
+
+    if reached <= stages.index(Stage.RFD3):
         spec_names = [spec.name for spec in rfd3.specs]
         print(f"phase rfd3: fanning out to {spec_names}", flush=True)
         rfd3_results = list(
@@ -339,23 +648,55 @@ def orchestrate(campaign_payload: dict, start_at: str = "rfd3", chunk_size: int 
         report["rfd3"] = rfd3_results
         designs = [d for result in rfd3_results for d in result["designs"]]
     else:
-        from pathlib import Path
-
-        out_dir = Path(_run_root(campaign)) / "rfd3" / "out"
-        designs = sorted(p.stem for p in out_dir.glob("*.json"))
+        designs = sorted(p.stem for p in (root / "rfd3" / "out").glob("*.json"))
     report["n_designs"] = len(designs)
     print(f"phase rfd3 done: {len(designs)} designs", flush=True)
 
-    chunks = [designs[i : i + chunk_size] for i in range(0, len(designs), chunk_size)]
-    print(f"phase filter: {len(chunks)} chunk(s) of up to {chunk_size}", flush=True)
-    report["backbone_filters"] = list(
-        filter_designs.map(chunks, kwargs={"campaign_payload": campaign_payload})
+    if reached <= stages.index(Stage.BACKBONE_FILTERS):
+        chunks = chunked(designs)
+        print(f"phase filter: {len(chunks)} chunk(s) of up to {chunk_size}", flush=True)
+        report["backbone_filters"] = list(
+            filter_designs.map(chunks, kwargs={"campaign_payload": campaign_payload})
+        )
+
+    # Only backbones that passed go to MPNN. The verdict lives in the shards
+    # rather than in the filter step's return value, so that restarting at
+    # `mpnn` selects exactly the same set as a continuous run would.
+    passing = _passing_designs(root)
+    report["n_passing_backbone_filters"] = len(passing)
+    chunks = chunked(passing)
+    print(
+        f"phase mpnn: {len(passing)} of {len(designs)} passed, "
+        f"{len(chunks)} chunk(s) of up to {chunk_size}",
+        flush=True,
     )
+    if chunks:
+        report["mpnn"] = list(
+            run_mpnn.map(chunks, kwargs={"campaign_payload": campaign_payload})
+        )
 
     print("phase reduce", flush=True)
     report["reduce"] = reduce_summaries.remote(campaign_payload)
     print("orchestrate: done", flush=True)
     return report
+
+
+def _passing_designs(root) -> list[str]:
+    """Design IDs whose backbone shard says they passed the filters.
+
+    Reads the backbone shards specifically -- those with a `design_id` and no
+    `seq_id` -- so a re-run over a directory that already holds sequence shards
+    does not feed sequence rows back in as designs.
+    """
+    from rfd3_pipeline.report import read_shards
+
+    return sorted(
+        record["design_id"]
+        for record in read_shards(root / "shards")
+        if record.get("design_id")
+        and not record.get("seq_id")
+        and record.get("bb_pass") is True
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -445,16 +786,32 @@ def install_weights():
 
 
 @app.local_entrypoint()
-def reduce_only(campaign: str):
+def install_mpnn_weights():
+    _show(populate_mpnn_weights.remote())
+
+
+@app.local_entrypoint()
+def reduce_only(campaign: str, dry_run: bool = False):
+    """Rebuild the summaries from existing shards, without re-running anything.
+
+    `--dry-run` has to be passed here too, and for the same reason the flag
+    renames the run: without it this reduces `{run_name}`, while the dry run's
+    shards are under `{run_name}-dryrun`, and the result is a summary of
+    nothing rather than an error.
+    """
     import yaml
     from pathlib import Path
 
-    from rfd3_pipeline.config import CampaignConfig
+    from rfd3_pipeline.config import CampaignConfig, apply_dry_run
 
-    payload = CampaignConfig.model_validate(
-        yaml.safe_load(Path(campaign).read_text())
-    ).model_dump(mode="json")
-    _show(reduce_summaries.remote(payload))
+    payload = yaml.safe_load(Path(campaign).read_text())
+    if dry_run:
+        payload = apply_dry_run(payload)
+    _show(
+        reduce_summaries.remote(
+            CampaignConfig.model_validate(payload).model_dump(mode="json")
+        )
+    )
 
 
 def _show(report: dict, indent: str = "") -> None:
