@@ -53,6 +53,24 @@ project path is 97 characters and `LongPathsEnabled = 0` on this machine. Watch
 free space on `C:`; it has hit 100% once, which breaks OneDrive sync and the
 Modal client together.
 
+**Clone anything destined for a Linux image with `core.autocrlf=false`.**
+[verified 2026-10-07] On Windows git defaults to `true` and rewrites LF to CRLF
+on checkout. Those files then go into the image as-is and shell scripts break in
+ways that name the wrong culprit -- the ESMFold2 kit died on
+`run.sh: line 19: set: pipefail: invalid option name`, which is bash reading
+`pipefail\r`, not a bad script. Files that are *sourced* rather than executed are
+worse: a `configs/*.env` with CRLF sets every variable with a trailing `\r` and
+the failure surfaces much later as an unexplained `exit 3`.
+
+    git clone -c core.autocrlf=false ...
+    # repair an existing clone:
+    git -C <dir> config core.autocrlf false
+    git -C <dir> rm --cached -r -q . && git -C <dir> reset --hard -q
+
+Also note the long-path limit applies to clones under the scratchpad directory:
+a `git clone` there failed with `Filename too long` while the same clone
+succeeded under `~/`.
+
 ---
 
 ## 1. Writing the campaign config
