@@ -211,20 +211,98 @@ values have never been run against a population. **[unconfirmed]**
 
 ---
 
-## 6. Reduce and summaries
+## 6. MPNN
+
+**`--chains_to_design` is not optional.** [verified 2026-10-07] Omit it and MPNN
+designs *every* chain: it invents new sequences for the target chains and
+optimises the binder against them. It does not error, and the binder sequences
+look entirely plausible -- they are simply optimised against a target that does
+not exist. Pass the binder chain. The giveaway in the log is `num_res` counting
+the whole system minus only the fixed residues.
+
+Verification that costs nothing: the target segments of every design must come
+back byte-identical to the native record's.
+
+**`--seed 0` was silently discarded until fixed locally.** [verified
+2026-10-07] Upstream `run.py` tested `if args.seed:`, falsy for zero, so an
+explicit seed of 0 was replaced with `np.random.randint(0, 99999)`. With
+argparse's `default=0`, the documented default was in fact "random" and seed 0
+could not be requested at all. This campaign sets `general.base_seed: 0`, so
+sequence generation was unreproducible while reporting a seed it had invented
+(observed: 87657). Fixed in the vendored copy; see
+`LigandMPNN/LOCAL_CHANGES.md`. If the vendored tree is ever re-pulled from
+upstream, this returns.
+
+**The first FASTA record is the input sequence, not a design.** [verified
+2026-10-07] `num_seqs: 8` yields nine records. Treating the first as a design
+gives every backbone one bogus sequence identical to its input.
+
+**Chains are joined by `:` in the FASTA**
+(`--fasta_seq_separation`), binder first since it is chain A. A record holding a
+target's sequence as the binder's would be refolded as though it were the
+binder.
+
+**MPNN wants PDB; RFD3 writes gzipped mmCIF.** Convert with ProDy, which is
+MPNN's own parser, rather than introducing a second opinion about the structure.
+RFD3 output needs no `UNK` -> `GLY` rewriting (`has_UNK: False`), so the
+preprocessing in the bundled `wrapper.py` is unnecessary here.
+
+**Batch per chunk, not per design.** MPNN is ~7.5 s for eight sequences over a
+520-residue system, nearly all of it loading the model, so a container per
+design is almost pure startup. `--pdb_path_multi` and `--fixed_residues_multi`
+take JSON maps (`{"/path/to.pdb": ""}` -- only the keys are read for the former),
+so one invocation covers a chunk with per-design fixed residues.
+
+**Do not re-derive `fixed_residues` here.** Read the value the backbone filters
+recorded in the design's shard. The numbering conversion lives in exactly one
+place because getting it wrong is silent, and reading the recorded value also
+makes `--start-at mpnn` select the same designs a continuous run would.
+
+**The bundled `wrapper.py` is not usable as-is.** It passes `--return_logits`
+and `--temperature_per_residue`, which this `run.py` does not define (they come
+from a fork), so those calls exit 2. It also uses
+`subprocess.run(capture_output=True)` -- the blindness described in section 0.
+
+---
+
+## 7. Reduce and summaries
 
 **Everything the reducer writes is derived**, so it is safe to re-run at any
 point, and `reduce_only` is how a restarted campaign recovers its summaries
 without re-running the GPU stage. `orchestrate --start-at` likewise skips
 straight to filtering over designs already on the volume.
 
+**`reduce_only` needs `--dry-run` too.** [verified 2026-10-07] The flag renames
+the run, so without it this reduces `{run_name}` while the dry run's shards sit
+under `{run_name}-dryrun`. The result is a summary of nothing -- `n_records: 0`
+-- rather than an error.
+
+**A design's shards describe it at several stages, and the records must be
+collapsed before summarising.** [verified 2026-10-07] Sequence records carry the
+backbone's `bb_*` columns forward, so counting backbone and sequence shards
+together double counts: one passing backbone with two sequences reported
+`n_passing_backbone_filters: 3`. `latest_records` drops a backbone record once
+sequences exist for that design and keeps it otherwise, which is the intended
+set -- one row per sequence, plus the backbones that died before MPNN. The
+shards themselves are left alone, so a restart still sees every verdict.
+
+Related: tallies over a one-row-per-sequence table must count **distinct
+designs**, not rows. A backbone with eight sequences is one design that passed,
+not eight.
+
+**The backbone-to-sequence link is already in the summary, twice.** Every
+sequence row carries `design_id`, and `seq_id` is `{design_id}_seq{N}`; they sit
+adjacent in the leading columns. Group by `design_id` for a backbone's
+sequences. Do not add a third representation of the same relation.
+
 ---
 
-## 7. Stages not built yet (MPNN, apo/holo, cross-validation)
+## 8. Stages not built yet (apo/holo refolding, cross-validation)
 
 Recorded now because the traps are already known and all are the silent kind.
 All **[verified 2026-09-28]** against upstream source, not docs. Re-check if
-those repos move.
+those repos move. The first of these is where the egress trap below starts to
+matter, so it is worth reading before that stage is written rather than after.
 
 **`sokrypton/alphafold3 --use_msa_server` does not cache, despite its help text
 saying results are cached in `--cache_dir`.** `run_alphafold.py:1728` calls
@@ -258,7 +336,7 @@ built; resolution emits a warning rather than skipping the work.
 
 ---
 
-## 8. Working on `app.py` itself
+## 9. Working on `app.py` itself
 
 The two module rules in section 3 are the whole of it, and both were learned the
 expensive way. The module docstring (`app.py:10-19`) states them.

@@ -72,6 +72,16 @@ class TestRecordSet:
     def test_sequences_are_in_file_order(self, records):
         assert [r["sequence"] for r in records] == [BINDER_1, BINDER_2]
 
+    def test_every_row_records_how_many_sequences_the_design_yielded(self, records):
+        """An invariant, not a link: a design that quietly produced fewer than
+        `num_seqs` is otherwise only visible by counting rows."""
+        assert [r["mpnn_n_seqs"] for r in records] == [2, 2]
+
+    def test_the_count_excludes_the_native_record(self):
+        one = f">input, T=0.1\n{BINDER_NATIVE}\n>input, id=1\n{BINDER_1}\n"
+        (record,) = modal_app._mpnn_records(one, "d", BACKBONE, _Mpnn())
+        assert record["mpnn_n_seqs"] == 1
+
 
 class TestBinderExtraction:
     def test_only_the_binder_segment_is_kept(self, records):

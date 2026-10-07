@@ -455,8 +455,9 @@ def _mpnn_records(text: str, design_id: str, backbone: dict, mpnn) -> list[dict]
             entries.append((header, line))
             header = None
 
+    designs = entries[1:]
     records: list[dict] = []
-    for index, (head, sequence) in enumerate(entries[1:], start=1):
+    for index, (head, sequence) in enumerate(designs, start=1):
         meta: dict[str, str] = {}
         for field in head.split(","):
             key, sep, value = field.partition("=")
@@ -474,6 +475,11 @@ def _mpnn_records(text: str, design_id: str, backbone: dict, mpnn) -> list[dict]
                 "seq_id": f"{design_id}_seq{index}",
                 "design_id": design_id,
                 "mpnn_index": index,
+                # Not a link to the backbone -- `design_id` and `seq_id` already
+                # carry that -- but an invariant. Every design should yield
+                # `num_seqs`, and one that quietly yielded fewer is otherwise
+                # visible only by counting rows, which nobody does at scale.
+                "mpnn_n_seqs": len(designs),
                 "stage_reached": Stage.MPNN,
                 "sequence": binder_sequence,
                 "seq_length": len(binder_sequence),
