@@ -41,6 +41,22 @@ would refuse with a confusing `exit 3`. To repair an existing clone:
 Note that repairing it invalidates the `COPY esmfold2` layer, which precedes the
 wheel build, so the ~44 minute compile runs again.
 
+The context also needs an empty jitcache tar, which the kit does not ship:
+
+    mkdir -p ~/ubm/_jitcache
+    tar -cf ~/ubm/_jitcache/esmfold2-empty-jit.tar --files-from /dev/null
+
+The Dockerfile's last COPY is `esmfold2/environment/Dockerfile
+_jitcache/esmfold2-*-jit.ta[r] /tmp/jit/`. The `.ta[r]` bracket is the standard
+Docker idiom for an *optional* source -- a bracket glob matching nothing is
+tolerated so long as another source matched -- and the kit's own comment says
+"build is identical when no tar is present". **Modal's `from_dockerfile` does
+not implement that**: it fails the build with `COPY source glob pattern ... did
+not match any files`. The following `RUN` guards each file with `[ -f "$t" ]`,
+so an empty archive extracts nothing and the image is identical to having no
+tar at all. That is why this is a context fix rather than a patch to their
+Dockerfile.
+
 Facts this encodes, read off `esmfold2/README.md` rather than assumed:
 
   * `--variant fast|full_msa|full_nomsa` is **required**, no default, one per
