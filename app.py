@@ -39,6 +39,16 @@ WEIGHTS = "/weights"
 JIT = "/jit"
 RFD3_CHECKPOINTS = f"{WEIGHTS}/rfd3"
 MPNN_CHECKPOINTS = f"{WEIGHTS}/ligandmpnn"
+ESM_WEIGHTS = f"{WEIGHTS}/esmfold2"
+ESM_JIT = f"{JIT}/esmfold2"
+ESM_KIT = "/kit/esmfold2"
+
+# The kit's `--config` card follows the GPU, not the model. `GPU_TO_CARD` in
+# config.py is the validated mapping; this is its string form for the CLI.
+GPU_TO_KIT_CARD = {
+    "A100": "a100", "A100-40GB": "a100", "A100-80GB": "a100",
+    "H100": "h100", "H200": "h200",
+}
 
 VOLUMES = {DATA: data_volume, WEIGHTS: weights_volume, JIT: jit_volume}
 
@@ -109,6 +119,36 @@ MPNN_MODELS = {
     "protein": ("protein_mpnn", "--checkpoint_protein_mpnn", "proteinmpnn_v_48_020.pt"),
     "ligand": ("ligand_mpnn", "--checkpoint_ligand_mpnn", "ligandmpnn_v_32_010_25.pt"),
 }
+
+# ESMFold2. Built from the kit's own Dockerfile rather than assembled here: its
+# route C wants uv, a C++ compiler, the CUDA 13.0 toolkit and two Biohub
+# packages at pinned commits, and anything off-pin exits 3. The checkout lives
+# outside this repo -- `experiments/esmfold2_image.py` documents the two-command
+# setup, including the `core.autocrlf=false` and empty-jitcache requirements
+# that are not optional. `BUILD_JOBS` is pinned because the Dockerfile's own
+# heuristic over-subscribes memory and gets the build OOM-killed on a smaller
+# builder. The kit's requirements.lock already carries biotite, numpy, pydantic
+# and pyyaml, so `rfd3_pipeline` needs no extra installs here.
+ESM_KIT_CONTEXT = Path.home() / "ubm"
+
+esmfold2_image = (
+    modal.Image.from_dockerfile(
+        ESM_KIT_CONTEXT / "esmfold2" / "environment" / "Dockerfile",
+        context_dir=ESM_KIT_CONTEXT,
+        build_args={"STACK": "img_esmfold2_a100", "BUILD_JOBS": "8"},
+    )
+    .env(
+        {
+            # The kit reads the weights root from HF_HOME, not from a flag.
+            "HF_HOME": ESM_WEIGHTS,
+            # Without a persistent root, every container pays a cold Triton
+            # compile. `install_esm_jit` fills it once.
+            "MODEL_OPT_JIT_ROOT": ESM_JIT,
+            "PYTHONUNBUFFERED": "1",
+        }
+    )
+    .add_local_python_source("rfd3_pipeline")
+)
 
 HOUR = 60 * 60
 
@@ -582,6 +622,314 @@ def _spec_of(design_id: str, by_name: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Refolding (apo and holo)
+# ---------------------------------------------------------------------------
+# Stage name -> (include_targets, supplies_msa). The two stages differ only in
+# what goes into the input JSON, which is why they share one function. The
+# variant follows from `supplies_msa` via `folding_variant`, so no field can
+# contradict the step's MSA policy.
+REFOLD_STAGES = {"apo": (False, False), "holo": (True, True)}
+
+# Column prefixes a stage owns or supersedes, dropped from the shard before its
+# own are written. Re-running a stage otherwise inherits its previous attempt's
+# columns, and the diagnostic fields are the ones that mislead: an apo re-run
+# that computed pLDDT fine still carried the earlier run's
+# `apo_plddt_error`, so the row claimed both a value and a failure.
+REFOLD_SUPERSEDES = {
+    "apo": ("apo_", "holo_", "cv_", "rank_", "cluster_"),
+    "holo": ("holo_", "cv_", "rank_", "cluster_"),
+}
+
+# One function per folding model, because a Modal function's image is fixed at
+# decoration time and `with_options` cannot override it -- only cpu/memory/gpu
+# and friends. Keyed by `FoldingModel`'s value as a plain string, the same way
+# `MPNN_MODELS` is, so nothing library-typed crosses a function boundary.
+# Add a model by adding an image, a three-line wrapper and an entry here; only
+# the models a campaign actually uses need defining, since every image declared
+# here is built on the next `modal run`.
+REFOLD_FUNCTIONS: dict[str, object] = {}
+
+
+def _refold(seq_ids: list[str], campaign_payload: dict, stage: str) -> dict:
+    """Refold a chunk of MPNN sequences, writing `{stage}_*` columns per shard.
+
+    Shared by every per-model wrapper below. The kit is invoked once for the
+    whole chunk: `--input` takes a list, and each process pays ~180 s of
+    start-up (checkpoint load, CCD dictionary, CUDA graph capture) against
+    ~55 s per 100-residue fold, so a process per sequence would be mostly
+    start-up.
+    """
+    import json
+
+    from rfd3_pipeline.config import folding_variant
+    from rfd3_pipeline.gates import Stage
+    from rfd3_pipeline.report import read_shards, write_shard
+
+    data_volume.reload()
+
+    include_targets, supplies_msa = REFOLD_STAGES[stage]
+    campaign = _campaign_from(campaign_payload)
+    refolding = campaign.refolding
+    binder = campaign.general.chain_binder
+    root = Path(_run_root(campaign))
+    shards = root / "shards"
+    out_root = root / stage
+    work = Path("/tmp") / stage
+    work.mkdir(parents=True, exist_ok=True)
+
+    variant = folding_variant(refolding.model, supplies_msa)
+    if variant is None:
+        raise ValueError(
+            f"{refolding.model.value} has no --variant for msa_present="
+            f"{supplies_msa}; its MODEL_CAPABILITIES row needs filling in"
+        )
+
+    by_seq = {
+        record["seq_id"]: record
+        for record in read_shards(shards)
+        if record.get("seq_id") and record.get("sequence")
+    }
+
+    # Target sequences come from the input structure once per campaign, not from
+    # the shards -- they are identical for every prediction.
+    target_sequences: dict[str, str] = {}
+    if include_targets:
+        from rfd3_pipeline.spec import resolve_campaign
+
+        resolved = resolve_campaign(campaign, structure_root=DATA)
+        target_sequences = dict(resolved.target_sequences)
+
+    items, prepared, skipped = [], [], []
+    for seq_id in seq_ids:
+        record = by_seq.get(seq_id)
+        if record is None:
+            skipped.append({"seq_id": seq_id, "reason": "no sequence shard"})
+            continue
+
+        # The binder is always suppressed: a de novo binder has no homologs, and
+        # leaving `msa` unset would send it to the MSA server. `full_nomsa`
+        # would not read one anyway, but holo's `full_msa` would.
+        chains = [
+            {"type": "protein", "id": binder, "sequence": record["sequence"], "msa": None}
+        ]
+        if include_targets:
+            missing = [c for c in campaign.general.chain_targets if c not in target_sequences]
+            if missing:
+                skipped.append({"seq_id": seq_id, "reason": f"no target sequence for {missing}"})
+                continue
+            for chain in campaign.general.chain_targets:
+                chains.append(
+                    {
+                        "type": "protein",
+                        "id": chain,
+                        "sequence": target_sequences[chain],
+                        # Set explicitly even when empty: `fill_missing_msas`
+                        # gates the unpaired and paired queries on *different*
+                        # fields, so leaving either as null sends the sequence
+                        # out. The target MSA cache fills this in when built.
+                        "msa": None,
+                    }
+                )
+
+        # `id` names the output file, so the result is directly addressable.
+        items.append(
+            {
+                "id": seq_id,
+                "sequences": chains,
+                "seeds": [campaign.general.base_seed],
+                "num_diffusion_samples": 1,
+            }
+        )
+        prepared.append(seq_id)
+
+    if not prepared:
+        return {"returncode": 0, "stage": stage, "n_written": 0, "skipped": skipped}
+
+    input_json = work / f"{stage}_input.json"
+    input_json.write_text(json.dumps(items, indent=2))
+    out_dir = work / "out"
+
+    command = [
+        "bash", "run.sh", "pred",
+        "--config", GPU_TO_KIT_CARD[refolding.gpu],
+        "--mode", refolding.mode.value,
+        # Required, no default, one per process.
+        "--variant", variant,
+        "--input", str(input_json),
+        "--out_dir", str(out_dir),
+        "--seeds", str(campaign.general.base_seed),
+        "--det", "1",
+    ]
+    print(f"{stage}: {len(prepared)} sequence(s), variant {variant}", flush=True)
+    returncode, output_tail = _stream(command, timeout=4 * HOUR, cwd=ESM_KIT)
+
+    # Exit 3 is the kit refusing to engage a mode, by name, rather than falling
+    # back to stock. It is a configuration error, not a failed fold.
+    if returncode == 3:
+        raise RuntimeError(
+            f"{stage}: kit mode '{refolding.mode.value}' could not engage "
+            f"(exit 3). Its reason is on the NOT ACTIVE line:\n{output_tail}"
+        )
+
+    written = []
+    if returncode == 0:
+        rows = _pred_rows(out_dir / "pred_rows.jsonl")
+        out_root.mkdir(parents=True, exist_ok=True)
+        superseded = REFOLD_SUPERSEDES[stage]
+        for seq_id in prepared:
+            record = {
+                key: value
+                for key, value in by_seq[seq_id].items()
+                if not key.startswith(superseded)
+            }
+            metrics = _refold_metrics(
+                seq_id, stage, rows.get(seq_id), out_dir, root, binder, campaign
+            )
+            record.update(metrics)
+            record["stage_reached"] = getattr(Stage, stage.upper())
+            write_shard(record, shards)
+            written.append(seq_id)
+
+            # Keep the structure: holo needs the apo one for the apo/holo RMSD.
+            produced = sorted((out_dir / "cif_all").glob(f"{seq_id}__*"))
+            for path in produced:
+                (out_root / seq_id).mkdir(parents=True, exist_ok=True)
+                (out_root / seq_id / path.name).write_bytes(path.read_bytes())
+
+    data_volume.commit()
+    print(f"{stage}: exit {returncode}, {len(written)} record(s)", flush=True)
+    return {
+        "returncode": returncode,
+        "stage": stage,
+        "variant": variant,
+        "n_written": len(written),
+        "skipped": skipped,
+        "output_tail": output_tail,
+    }
+
+
+def _pred_rows(path) -> dict:
+    """`pred_rows.jsonl` keyed by complex id.
+
+    The kit appends to this file, so a re-run in the same out_dir leaves older
+    rows behind; the last row for an id wins.
+    """
+    import json
+
+    rows: dict[str, dict] = {}
+    if not path.is_file():
+        return rows
+    for line in path.read_text().splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            row = json.loads(line)
+        except ValueError:
+            continue
+        if row.get("complex_id"):
+            rows[row["complex_id"]] = row
+    return rows
+
+
+def _refold_metrics(seq_id, stage, row, out_dir, root, binder, campaign) -> dict:
+    """The `{stage}_*` columns for one sequence.
+
+    `pred_rows.jsonl` supplies what the kit measured; the rest is computed from
+    the predicted structure. Every field is optional on purpose -- a missing
+    metric should leave a null in the summary rather than lose the chunk.
+    """
+    prefix = f"{stage}_"
+    metrics: dict[str, object] = {
+        f"{prefix}status": (row or {}).get("status"),
+        f"{prefix}ptm": _as_float((row or {}).get("ptm")),
+        f"{prefix}iptm": _as_float((row or {}).get("iptm")),
+        f"{prefix}n_tokens": _as_int((row or {}).get("n_tokens")),
+        f"{prefix}wall_s": _as_float((row or {}).get("wall_s")),
+        # Positive evidence about the MSA rather than trust in the flag: 0 means
+        # the fold genuinely saw no alignment.
+        f"{prefix}msa_depth": max((row or {}).get("msa_depths") or [0]),
+    }
+
+    cifs = sorted((out_dir / "cif_all").glob(f"{seq_id}__*.cif"))
+    if not cifs:
+        metrics[f"{prefix}error"] = "no cif produced"
+        return metrics
+
+    from rfd3_pipeline.structure import chain_subset, ca_only, load_structure, match_ca
+
+    # `b_factor` is where the kit writes pLDDT, and biotite does not read it
+    # unless asked -- without this the attribute is absent entirely.
+    predicted = load_structure(cifs[0], extra_fields=["b_factor"])
+
+    # Mean pLDDT over the binder's alpha carbons. ESMFold2 writes it into the
+    # B-factor column; guarded because a format change should not lose the fold.
+    try:
+        binder_ca = ca_only(chain_subset(predicted, [binder]))
+        metrics[f"{prefix}plddt_binder"] = float(binder_ca.b_factor.mean())
+    except Exception as error:
+        metrics[f"{prefix}plddt_binder"] = None
+        metrics[f"{prefix}plddt_error"] = f"{type(error).__name__}: {error}"
+
+    # Did the sequence fold into the backbone it was designed for? This is the
+    # question apo exists to answer, so it is computed against the RFD3 design
+    # rather than taken from the kit.
+    design_id = (seq_id.rsplit("_seq", 1)[0]) if "_seq" in seq_id else None
+    design_path = root / "rfd3" / "out" / f"{design_id}.cif.gz" if design_id else None
+    if design_path is not None and design_path.is_file():
+        try:
+            from rfd3_pipeline.metrics.rmsd import superimpose_rmsd
+
+            design = load_structure(design_path)
+            design_ca, predicted_ca, _ = match_ca(design, predicted, chains=[binder])
+            metrics[f"{prefix}rmsd_to_design"] = superimpose_rmsd(design_ca, predicted_ca)
+        except Exception as error:
+            metrics[f"{prefix}rmsd_to_design"] = None
+            metrics[f"{prefix}rmsd_error"] = f"{type(error).__name__}: {error}"
+
+    # One gate is available from apo alone. `threshold_rmsd_apo_holo` and
+    # `threshold_ipTM` need holo, so they are not evaluated here.
+    plddt = metrics.get(f"{prefix}plddt_binder")
+    if stage == "apo" and plddt is not None:
+        metrics["apo_pass"] = plddt >= campaign.refolding.threshold_plddt_binder
+    return metrics
+
+
+@app.function(image=esmfold2_image, gpu="A100-40GB", volumes=VOLUMES, timeout=4 * HOUR)
+def refold_esmfold2(seq_ids: list[str], campaign_payload: dict, stage: str) -> dict:
+    """ESMFold2's wrapper over `_refold`. One per model, because the image is
+    fixed at decoration time."""
+    return _refold(seq_ids, campaign_payload, stage)
+
+
+@app.function(image=esmfold2_image, gpu="A100-40GB", volumes=VOLUMES, timeout=HOUR)
+def install_esm_jit() -> dict:
+    """Precompile the kit's Triton kernels into the jit volume, once.
+
+    Needs a GPU to compile for, so it is a GPU function despite doing no
+    folding. Without it each of ~640 predictions pays a cold compile.
+    """
+    Path(ESM_JIT).mkdir(parents=True, exist_ok=True)
+    returncode, output_tail = _stream(
+        ["bash", "run.sh", "warm", "--config", "a100",
+         "--variant", "full_nomsa", "--mode", "fast"],
+        timeout=HOUR,
+        cwd=ESM_KIT,
+    )
+    jit_volume.commit()
+    cached = [p for p in Path(ESM_JIT).rglob("*") if p.is_file()]
+    return {
+        "returncode": returncode,
+        "jit_files": len(cached),
+        "jit_mb": round(sum(p.stat().st_size for p in cached) / 1e6, 1),
+        "output_tail": output_tail,
+    }
+
+
+REFOLD_FUNCTIONS["esmfold2"] = refold_esmfold2
+
+
+# ---------------------------------------------------------------------------
 # Reduce
 # ---------------------------------------------------------------------------
 @app.function(image=cpu_image, volumes=VOLUMES, timeout=HOUR)
@@ -654,7 +1002,7 @@ def orchestrate(campaign_payload: dict, start_at: str = "rfd3", chunk_size: int 
     print(f"orchestrate: start_at={start_at}, {len(rfd3.specs)} spec(s)", flush=True)
 
     root = Path(_run_root(campaign))
-    stages = Stage.ORDER[: Stage.ORDER.index(Stage.MPNN) + 1]
+    stages = Stage.ORDER[: Stage.ORDER.index(Stage.APO) + 1]
     if start_at not in stages:
         raise ValueError(f"start_at must be one of {list(stages)}, got {start_at!r}")
     reached = stages.index(start_at)
@@ -705,17 +1053,59 @@ def orchestrate(campaign_payload: dict, start_at: str = "rfd3", chunk_size: int 
     data_volume.reload()
     passing = _passing_designs(root)
     report["n_passing_backbone_filters"] = len(passing)
-    chunks = chunked(passing)
+
+    # Gated like every other phase. Without this, `--start-at apo` re-ran MPNN
+    # and regenerated sequences that already existed -- harmless at dry-run
+    # scale because MPNN is deterministic under a fixed seed, but a wasted GPU
+    # pass over every passing design at campaign scale, and it defeats the
+    # point of starting late.
+    if reached <= stages.index(Stage.MPNN):
+        chunks = chunked(passing)
+        print(
+            f"phase mpnn: {len(passing)} of {len(designs)} passed, "
+            f"{len(chunks)} chunk(s) of up to {chunk_size}, "
+            f"max_concurrent={campaign.mpnn.max_concurrent}",
+            flush=True,
+        )
+        if chunks:
+            report["mpnn"] = list(
+                run_mpnn.with_options(max_containers=campaign.mpnn.max_concurrent).map(
+                    chunks, kwargs={"campaign_payload": campaign_payload}
+                )
+            )
+
+    # The sequences MPNN just wrote were committed by other containers.
+    data_volume.reload()
+    sequences = _sequence_ids(root)
+    report["n_sequences"] = len(sequences)
+
+    refolding = campaign.refolding
+    refold = REFOLD_FUNCTIONS.get(refolding.model.value)
+    if refold is None:
+        raise ValueError(
+            f"no refold function for model {refolding.model.value!r}; "
+            f"have {sorted(REFOLD_FUNCTIONS)}. Add an image and a wrapper."
+        )
+
+    # Apo folds the binder alone, so its chunks are sized by the refolding
+    # config rather than the design chunk_size.
+    apo_chunks = [
+        sequences[i : i + refolding.chunk_size]
+        for i in range(0, len(sequences), refolding.chunk_size)
+    ]
     print(
-        f"phase mpnn: {len(passing)} of {len(designs)} passed, "
-        f"{len(chunks)} chunk(s) of up to {chunk_size}, "
-        f"max_concurrent={campaign.mpnn.max_concurrent}",
+        f"phase apo: {len(sequences)} sequence(s), {len(apo_chunks)} chunk(s) "
+        f"of up to {refolding.chunk_size}, max_concurrent="
+        f"{refolding.max_concurrent}",
         flush=True,
     )
-    if chunks:
-        report["mpnn"] = list(
-            run_mpnn.with_options(max_containers=campaign.mpnn.max_concurrent).map(
-                chunks, kwargs={"campaign_payload": campaign_payload}
+    if apo_chunks:
+        report["apo"] = list(
+            refold.with_options(
+                gpu=refolding.gpu, max_containers=refolding.max_concurrent
+            ).map(
+                apo_chunks,
+                kwargs={"campaign_payload": campaign_payload, "stage": "apo"},
             )
         )
 
@@ -723,6 +1113,21 @@ def orchestrate(campaign_payload: dict, start_at: str = "rfd3", chunk_size: int 
     report["reduce"] = reduce_summaries.remote(campaign_payload)
     print("orchestrate: done", flush=True)
     return report
+
+
+def _sequence_ids(root) -> list[str]:
+    """Every MPNN sequence on the volume, as `seq_id`s.
+
+    Read from the shards rather than from the MPNN step's return value, so that
+    restarting at `apo` selects exactly the set a continuous run would.
+    """
+    from rfd3_pipeline.report import read_shards
+
+    return sorted(
+        record["seq_id"]
+        for record in read_shards(root / "shards")
+        if record.get("seq_id") and record.get("sequence")
+    )
 
 
 def _passing_designs(root) -> list[str]:
@@ -832,6 +1237,11 @@ def install_weights():
 @app.local_entrypoint()
 def install_mpnn_weights():
     _show(populate_mpnn_weights.remote())
+
+
+@app.local_entrypoint()
+def warm_esm_jit():
+    _show(install_esm_jit.remote())
 
 
 @app.local_entrypoint()

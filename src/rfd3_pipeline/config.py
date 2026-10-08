@@ -595,6 +595,28 @@ class CampaignConfig(_Base):
     ipsae: IpsaeConfig = Field(default_factory=IpsaeConfig)
     run: RunConfig = Field(default_factory=RunConfig)
 
+    @model_validator(mode="after")
+    def _cross_validation_uses_another_model(self) -> "CampaignConfig":
+        """Cross-validation must not use the refolding model.
+
+        The point of the stage is agreement between *independent* models, so the
+        same model on both sides is not cross-anything: it would run a second
+        full folding pass and report a model agreeing with itself. Nothing would
+        fail, and the resulting ranks would look like corroboration.
+
+        It also underwrites the one-image-per-model dispatch in `app.py`: a
+        Modal function's image is fixed at decoration time, so the two stages
+        are always two functions, and this guarantees the two models really do
+        differ rather than happening to.
+        """
+        if self.cross_validation.model == self.refolding.model:
+            raise ValueError(
+                f"cross_validation.model and refolding.model are both "
+                f"{self.refolding.model.value!r}; cross-validation must use a "
+                f"different model or it validates a model against itself"
+            )
+        return self
+
     @model_validator(mode="before")
     @classmethod
     def _accept_hyphenated_key(cls, data: Any) -> Any:

@@ -449,6 +449,59 @@ class.
 **The driver margin is thin.** Modal's A100-40GB fleet reports 580.95.05 and
 the kit requires `>= 580`.
 
+### Reading the metrics
+
+**`b_factor` is where pLDDT lives, and biotite does not read it by default.**
+[verified 2026-10-08] `load_structure(path, extra_fields=["b_factor"])` --
+without it the attribute is simply absent and confidence extraction fails with
+`AttributeError`. It had to be threaded through both the plain and the gzip
+branch.
+
+**`apo_rmsd_to_design` is the metric apo exists for**, and it is computed here
+rather than taken from the kit: superimpose the prediction's binder on the RFD3
+backbone it was designed for. A first run spread 1.31 A to 11.27 A across six
+sequences from three backbones, so it discriminates.
+
+**pLDDT, pTM and RMSD agreeing is the sanity check worth doing.** Three
+independently derived numbers -- one from the kit, one from the structure's
+B-factors, one from a superposition -- ranked the same six sequences the same
+way. If they disagree, suspect the wiring before the designs.
+
+**Every metric is guarded individually.** A format surprise should leave one
+null in the summary rather than lose a whole chunk. This earned itself
+immediately: the `b_factor` failure above cost one column and nothing else.
+
+### Re-running a stage
+
+**A stage must drop its own columns before rewriting them.** [verified
+2026-10-08] `_refold` starts from the shard as it finds it, and a shard already
+holds the previous attempt's columns. An apo re-run that computed pLDDT fine
+still carried the earlier run's `apo_plddt_error`, so the row asserted both a
+value and a failure:
+
+    apo_plddt_binder = 58.114
+    apo_plddt_error  = "AttributeError: ... no attribute 'b_factor'"
+
+`REFOLD_SUPERSEDES` drops a stage's own prefix plus every downstream one.
+Diagnostic fields are the dangerous ones: a stale number reads as a measurement
+and a stale error reads as a live problem. **Holo deliberately keeps apo's
+columns** -- the apo/holo RMSD gate needs them, and apo is a completed upstream
+stage rather than a previous attempt.
+
+**Every phase in `orchestrate` must be gated on `start_at`.** An ungated phase
+is invisible until a later stage exists beyond it: the MPNN phase was
+unconditional, which was correct while MPNN was last, and became a silent
+re-run of the whole GPU stage once `--start-at apo` was possible.
+
+### Gates
+
+`threshold_plddt_binder` is 70 and **has never been exercised against a
+population**. At dry-run scale all six sequences failed it, including one that
+reproduced its backbone to 1.31 A at pLDDT 68.3. Before trusting the number,
+check it against the RMSD distribution on a real campaign. `apo_pass` is the
+only gate apo can evaluate; `threshold_rmsd_apo_holo` and `threshold_ipTM`
+need holo.
+
 ---
 
 ## 9. Stages not built yet (holo refolding, cross-validation)
