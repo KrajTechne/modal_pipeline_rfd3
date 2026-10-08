@@ -155,10 +155,13 @@ class TestStructureConsistency:
 
 
 class TestWarnings:
-    def test_esmfold2_fast_warns_the_msa_is_unused(self, raw, alphav_structure):
+    def test_a_refolding_model_without_msas_never_reaches_resolution(self, raw, alphav_structure):
+        """This used to warn here. It is a config error now, so validation
+        rejects the campaign and resolution is never reached -- which is the
+        point: it fails on the client before any container starts."""
         merged = build(raw, refolding={"model": "esmfold2-fast"})
-        result = resolve(merged, alphav_structure)
-        assert any("does not read MSAs" in w for w in result.warnings)
+        with pytest.raises(ValueError, match="does not read "):
+            resolve(merged, alphav_structure)
 
     def test_credentials_warn_about_the_secret(self, raw, alphav_structure):
         merged = build(raw, msa={"username": "u", "password": "p"})

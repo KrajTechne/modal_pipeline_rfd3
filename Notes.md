@@ -855,10 +855,20 @@ large tarball.
 an explicit `--seeds a,b,c`; the AF3 fork takes `--num_seeds N` and *generates*
 the seeds, so the ones actually used are readable only from its output JSON.
 
-**Refolding models that do not read MSAs** still get the cached target MSA
-built; resolution emits a warning rather than skipping the work. On
-`esmfold2-fast` that warning is the signal that the whole cache step is dead
-weight for the campaign, not a problem to fix.
+**A refolding model that does not read MSAs is rejected at config time.**
+[settled 2026-10-08] Holo folds the binder against its targets, and a target
+folded from sequence alone is a worse model of the thing being bound -- the
+interface metrics would still be produced, describing a complex nobody asked
+for. This was a warning in `resolve_campaign` until the user decided the choice
+should be deliberate: naming a refolding model means confirming it supports
+alignments.
+
+Rejected in the schema rather than at the stage, so it fails on the client in
+seconds instead of after RFD3 and MPNN have spent GPU time.
+
+The practical effect is that **`esmfold2-fast` cannot be a refolding model.**
+It stays in the enum and the capability table so the schema can name what it is
+and refuse it for this role, rather than the choice silently degrading holo.
 
 **`supports_templates=False` for boltz2 is a deliberate false, not a measured
 one** -- held that way so a campaign cannot silently request something that may

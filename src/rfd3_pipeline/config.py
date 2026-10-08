@@ -680,6 +680,34 @@ class CampaignConfig(_Base):
     run: RunConfig = Field(default_factory=RunConfig)
 
     @model_validator(mode="after")
+    def _refolding_model_reads_msas(self) -> "CampaignConfig":
+        """The refolding model must consume MSAs.
+
+        Holo folds the binder against its targets, and a target folded from
+        sequence alone is a worse model of the thing being bound -- so the
+        interface metrics would still be produced, and would describe a complex
+        nobody asked for. Rejected here rather than warned about, because
+        choosing the refolding model is a decision to make deliberately: the
+        user confirms the model supports alignments.
+
+        Config-time rather than at the stage, so it fails on the client in
+        seconds instead of after RFD3 and MPNN have spent GPU time.
+
+        The practical effect is that `esmfold2-fast` cannot be a *refolding*
+        model. That is the point of keeping it in the enum and the capability
+        table: the schema can name what it is and refuse it for this role,
+        rather than the choice silently degrading holo.
+        """
+        if not self.refolding.consumes_msa:
+            raise ValueError(
+                f"refolding.model {self.refolding.model.value!r} does not read "
+                f"MSAs (consumes_msa is False), so holo would fold its targets "
+                f"from sequence alone and still report interface metrics. "
+                f"Choose a model that supports alignments."
+            )
+        return self
+
+    @model_validator(mode="after")
     def _cross_validation_uses_another_model(self) -> "CampaignConfig":
         """Cross-validation must not use the refolding model.
 

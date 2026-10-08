@@ -227,8 +227,15 @@ class TestModelCapabilities:
 
     def test_msa_consumption_read_from_the_table(self, raw):
         assert CampaignConfig.model_validate(raw).refolding.consumes_msa is True
-        fast = CampaignConfig.model_validate(build(raw, refolding={"model": "esmfold2-fast"}))
-        assert fast.refolding.consumes_msa is False
+        # Read from the table rather than through a campaign: a non-MSA model
+        # is no longer a valid *refolding* choice, so one cannot be built.
+        assert MODEL_CAPABILITIES[FoldingModel.ESMFOLD2_FAST].consumes_msa is False
+
+    def test_a_refolding_model_that_reads_no_msas_is_rejected(self, raw):
+        """Holo would fold its targets from sequence alone and still report
+        interface metrics."""
+        with pytest.raises(ValidationError, match="does not read "):
+            CampaignConfig.model_validate(build(raw, refolding={"model": "esmfold2-fast"}))
 
     def test_seed_style_read_from_the_table(self, raw):
         config = CampaignConfig.model_validate(raw)

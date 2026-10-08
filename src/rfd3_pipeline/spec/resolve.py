@@ -355,11 +355,6 @@ def resolve_campaign(
     target_sequences, sequence_warnings = _resolve_target_sequences(campaign, structure)
     warnings.extend(sequence_warnings)
 
-    if not campaign.refolding.consumes_msa:
-        warnings.append(
-            f"refolding model {campaign.refolding.model.value} does not read MSAs; "
-            "the cached target MSA will be built but unused for holo"
-        )
     if campaign.msa.needs_secret:
         warnings.append(
             "msa credentials are set, which is the one case requiring a Modal secret"

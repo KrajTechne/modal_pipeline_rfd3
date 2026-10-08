@@ -57,11 +57,12 @@ class TestDistinctModels:
             CampaignConfig.model_validate(payload)
 
     def test_a_different_pairing_still_validates(self, raw):
-        """The rule is "not equal", not a whitelist of pairings."""
+        """The rule is "not equal", not a whitelist of pairings. `boltz2`
+        rather than `esmfold2-fast`, since a refolding model has to read MSAs."""
         payload = copy.deepcopy(raw)
-        set_model(payload["refolding"], "esmfold2-fast")
+        set_model(payload["refolding"], "boltz2")
         campaign = CampaignConfig.model_validate(payload)
-        assert campaign.refolding.model.value == "esmfold2-fast"
+        assert campaign.refolding.model.value == "boltz2"
         assert campaign.cross_validation.model.value == "af3_jax"
 
     def test_distinct_models_are_accepted_either_way_round(self, raw):
