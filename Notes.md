@@ -596,12 +596,21 @@ re-run of the whole GPU stage once `--start-at apo` was possible.
 
 ### Gates
 
-`threshold_plddt_binder` is 70 and **has never been exercised against a
-population**. At dry-run scale all six sequences failed it, including one that
-reproduced its backbone to 1.31 A at pLDDT 68.3. Before trusting the number,
-check it against the RMSD distribution on a real campaign. `apo_pass` is the
-only gate apo can evaluate; `threshold_rmsd_apo_holo` and `threshold_ipTM`
-need holo.
+`threshold_plddt_binder` is **70, settled from the user's prior practice**
+(2026-10-08) rather than derived here.
+
+**Apo rejecting binders that holo scores above 70 is the intent, not a
+miscalibration.** Observed on a full run: two sequences failed apo at 63.9 and
+67.9 yet scored 72.5 and 71.6 at holo with ipTM 0.86. Apo is deliberately the
+harsher test -- a binder should fold correctly on its own, not only when the
+target holds it in place -- so filtering there is what spends holo's budget
+well. Do not "fix" this by lowering the gate.
+
+The dry run relaxes it to 40 via `DRY_RUN_OVERRIDES`, because at smoke scale 70
+rejects everything and holo folds nothing; that is about exercising the
+pipeline's shape, and the production value stays honest. `apo_pass` is the only
+gate apo can evaluate; `threshold_rmsd_apo_holo` and `threshold_ipTM` need
+holo.
 
 ---
 
