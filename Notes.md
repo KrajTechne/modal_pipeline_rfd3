@@ -342,13 +342,122 @@ sequences. Do not add a third representation of the same relation.
 
 ---
 
-## 8. Stages not built yet (apo/holo refolding, cross-validation)
+## 8. Apo refolding, and the ESMFold2 kit
+
+Apo prediction works as of 2026-10-08. Everything here was read off the kit or
+observed in a run, not inferred.
+
+### Building the kit image
+
+**It is not a package.** `Image.from_dockerfile` against the kit's own
+`esmfold2/environment/Dockerfile` is the supported route; route C (venv) wants
+uv, a C++ compiler, the CUDA 13.0 toolkit and two Biohub packages at pinned
+commits, and anything off-pin exits 3. The kit lives outside this repo at
+`~/ubm` -- see `experiments/esmfold2_image.py` for the two-command setup, which
+includes the autocrlf and `_jitcache` requirements from section 0 and below.
+
+**`STACK=img_esmfold2_a100`** for A100 (sm80 + sm90); the default `img_ef2_fa`
+is sm90 only. The stack choice doubles the flash-attn compile.
+
+**Pin `BUILD_JOBS`.** [verified 2026-10-08] The Dockerfile computes
+`JFA = MemAvailable / 9` for flash-attn, assuming ~9 GB per compile job. 17 jobs
+completed on a builder reporting 328 GB and were **OOM-killed (exit 137)** on
+one reporting 203 GB, so real peak is above ~12 GB. Modal allocates whichever
+builder is free, so the default makes success a coin flip. `BUILD_JOBS=8` fits
+either machine -- and was *faster*, 1543 s against 1932 s, because less memory
+pressure beat more parallelism.
+
+**Modal rejects Docker's optional-COPY idiom.** The last COPY is
+`_jitcache/esmfold2-*-jit.ta[r]`, where the `[r]` bracket makes a glob that
+matches nothing tolerable in Docker. Modal fails the build instead. Supply an
+empty archive; the following `RUN` guards with `[ -f "$t" ]`, so it extracts
+nothing and the image is identical:
+
+    mkdir -p ~/ubm/_jitcache
+    tar -cf ~/ubm/_jitcache/esmfold2-empty-jit.tar --files-from /dev/null
+
+**Do not put anything new under `esmfold2/`.** It is copied at Dockerfile line
+81, *before* the 32-minute wheel build at line 83, so any change there
+invalidates the cache. This is why the built wheels are parked at
+`~/esm_wheels/` rather than in `stock/wheels/` where `WHEELS_FROM=prebuilt`
+wants them.
+
+**`WHEELS_FROM=prebuilt` will not accept wheels you built yourself.** It checks
+each sha256 against `stock/PINS.json`, and wheel builds are not
+byte-reproducible, so all three mismatch. Patching `PINS.json` would fix it and
+costs exactly what it saves, since `PINS.json` is also under `esmfold2/`. Worth
+doing only when a rebuild is already forced for another reason.
+
+The *runtime* pin check is a different mechanism and does pass:
+`check_pins.py` validates by version string and reports all three as
+`pinned (stock/PINS.json "image" layer)`.
+
+### Running it
+
+**`--variant` is required, no default, one per process.** Apo is always
+`full_nomsa`; holo is `full_msa`. `--config` follows the GPU, not the model.
+
+**A mode that cannot engage exits 3 and never falls back.** Exit codes: 0 ok,
+1 failed, 2 usage, 3 not active. And **every config sets
+`ESMFOLD2_OPT_REQUIRE_FAST_ENV=1`, so even `--mode off` exits 3 without
+flash-attention and TransformerEngine** -- there is no unaccelerated escape
+hatch, which is what rules out any GPU with no kit card.
+
+**`server_mode=opt14_msa` under `full_nomsa` is not a contradiction.**
+[verified 2026-10-08] It is the internal name of `fast` mode's kernel
+composition (`FAST_LINE = KitMode("opt14_msa", {})`,
+`opt/esmfold2_opt/modes.py:135`), constant for `--mode fast` whatever the
+variant; `big` reports the same. The `msa` is the fused MSA-module kernel, which
+`full_nomsa` legitimately uses -- the module exists and is fed the query alone at
+depth 1.
+
+**On A100 expect `not_for_class=t16` and `card_support=uncertified:sm80`** on
+LEVER lines. The compute-capability-9.0 transition kernel stands down and the
+portable kernels serve. Informational, not failure.
+
+**`warm` is worth running once per campaign.** 285 Triton kernels, 17.1 MB, into
+`MODEL_OPT_JIT_ROOT` on the jit volume. Containers are ephemeral, so without it
+every prediction pays a cold compile.
+
+**Input is upstream's prediction-input JSON**: a *list* of items, each
+`{"id", "sequences": [{"type", "id", "sequence", "msa"}], "seeds",
+"num_diffusion_samples"}`. `id` names the output file, so setting it to `seq_id`
+makes results directly addressable. `--input` takes the list, which is what
+makes `chunk_size` worth having.
+
+**Output** is `<out_dir>/cif_all/<id>__<fast|full>__s<seed>_x<k>.cif` plus
+`..._pae.npz`, and an appended `pred_rows.jsonl`. The token is `fast`/`full`,
+not the variant name, so `full_nomsa` and `full_msa` are told apart only by
+`out_dir`.
+
+**`pred_rows.jsonl` carries the metrics**: `status`, `ptm`, `iptm`, `n_tokens`,
+`msa_depths`, `wall_s`. `msa_depths: [0]` is positive proof no MSA was used --
+check it rather than trusting the flag. `iptm: 0.0` is correct for apo, since
+ipTM scores an interface a monomer does not have.
+
+### Cost
+
+**Read `wall_s`, not the wall time of the step.** One 102-residue apo fold was
+`wall_s: 54.7` inside a stage that took 233.8 s; the difference is one-time
+startup -- checkpoint load, CCD dictionary, CUDA graph capture, kernel install.
+Marginal cost is ~55 s per sequence. Weight digest off the volume is 98.7 s for
+24.9 GiB, close enough to local disk not to matter.
+
+Do not extrapolate to holo: that is 524 residues with targets, a different cost
+class.
+
+**The driver margin is thin.** Modal's A100-40GB fleet reports 580.95.05 and
+the kit requires `>= 580`.
+
+---
+
+## 9. Stages not built yet (holo refolding, cross-validation)
 
 Recorded now because the traps are already known and all are the silent kind.
 Verified against upstream source rather than docs, dated per item -- most on
 2026-09-28, the `msa_server.py` mechanics on 2026-10-07. Re-check if those repos
-move. Worth reading *before* the apo stage is written rather than after: the
-egress trap below is the reason this section exists.
+move. Worth reading *before* holo is written rather than after: the egress trap
+below is the reason this section exists.
 
 **`sokrypton/alphafold3 --use_msa_server` does not cache, despite its help text
 saying results are cached in `--cache_dir`.** `run_alphafold.py:1728` calls
@@ -529,7 +638,7 @@ be ignored. See the table above.
 
 ---
 
-## 9. Working on `app.py` itself
+## 10. Working on `app.py` itself
 
 The two module rules in section 3 are the whole of it, and both were learned the
 expensive way. The module docstring (`app.py:10-19`) states them.
