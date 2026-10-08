@@ -55,7 +55,15 @@ VOLUMES = {DATA: data_volume, WEIGHTS: weights_volume, JIT: jit_volume}
 # ---------------------------------------------------------------------------
 # Images. `add_local_python_source` must come last: no build step may follow it.
 # ---------------------------------------------------------------------------
-PROJECT_DEPS = ("numpy>=1.26", "biotite>=1.0", "pyyaml>=6.0", "pydantic>=2.0")
+PROJECT_DEPS = (
+    "numpy>=1.26",
+    "biotite>=1.0",
+    "pyyaml>=6.0",
+    "pydantic>=2.0",
+    # The MSA client's only dependency. The ESMFold2 kit image already has it
+    # via its own lock, so this is for `cpu_image`, where the cache is built.
+    "requests>=2.31",
+)
 
 # CPU work: spec resolution, backbone filters, the reducer. No model, no GPU.
 cpu_image = (
@@ -622,6 +630,148 @@ def _spec_of(design_id: str, by_name: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Target MSA cache
+# ---------------------------------------------------------------------------
+@app.function(image=cpu_image, volumes=VOLUMES, timeout=4 * HOUR)
+def build_msa_cache(campaign_payload: dict, force: bool = False) -> dict:
+    """Fetch an unpaired alignment per target sequence, once per campaign.
+
+    Its own step, and run once rather than per prediction, because the target
+    sequences are fixed for a campaign: they come from the input structure and
+    do not change across 640 folds. The alignments are cached by a digest of
+    the sequence and the query options, so a re-run is free and a changed option
+    cannot be served a stale answer.
+
+    **Only target sequences leave this network.** The binder is never submitted:
+    a de novo binder has no homologs to find, and holo on esmfold2 does not
+    need one. The targets are the campaign's known input proteins.
+
+    Unpaired only. An unpaired MSA is a property of one sequence and so
+    cacheable; a paired MSA is a property of the set of chains queried together
+    and is not. ESMFold2 takes one a3m per chain and pairs internally, which is
+    why `msa_paired` is False for it and nothing paired is built here.
+    """
+    data_volume.reload()
+
+    from rfd3_pipeline.config import MODEL_CAPABILITIES
+    from rfd3_pipeline.msa import cache_key, query_colabfold, read_cached_a3m, write_cached_a3m
+    from rfd3_pipeline.spec import resolve_campaign
+
+    campaign = _campaign_from(campaign_payload)
+    capabilities = MODEL_CAPABILITIES[campaign.refolding.model]
+    root = Path(_run_root(campaign))
+    # Keyed per campaign rather than per run: the targets are the same for
+    # every run of a campaign, so a second run reuses the first one's work.
+    cache_dir = Path(DATA) / campaign.general.name_design_campaign / "msa_cache"
+
+    if not capabilities.consumes_msa:
+        return {
+            "skipped": (
+                f"{campaign.refolding.model.value} does not read MSAs "
+                f"(consumes_msa is False), so there is nothing to build"
+            ),
+            "cache_dir": str(cache_dir),
+        }
+
+    msa = campaign.msa
+    resolved = resolve_campaign(campaign, structure_root=DATA)
+    sequences = dict(resolved.target_sequences)
+    if not sequences:
+        return {"skipped": "no target sequences", "cache_dir": str(cache_dir)}
+
+    # Identical target chains collapse to one submission.
+    keys = {
+        chain: cache_key(sequence, use_env=msa.use_env, use_filter=msa.use_filter)
+        for chain, sequence in sequences.items()
+    }
+    wanted: dict[str, str] = {}
+    already: list[str] = []
+    for chain, sequence in sequences.items():
+        key = keys[chain]
+        if not force and read_cached_a3m(cache_dir, key) is not None:
+            already.append(chain)
+            continue
+        wanted[key] = sequence
+
+    fetched: dict[str, int] = {}
+    if wanted:
+        order = list(wanted)
+        print(
+            f"msa: querying {len(order)} target sequence(s) at {msa.host_url} "
+            f"(env={msa.use_env}, filter={msa.use_filter})",
+            flush=True,
+        )
+        results = query_colabfold(
+            [wanted[key] for key in order],
+            paired=False,
+            use_env=msa.use_env,
+            host_url=msa.host_url,
+            username=msa.username,
+            password=msa.password,
+            auth_header=msa.auth_header,
+        )
+        for key, a3m in zip(order, results):
+            if not a3m.strip():
+                raise RuntimeError(
+                    f"MSA server returned an empty alignment for {key}; "
+                    f"folding against it would be worse than failing here"
+                )
+            write_cached_a3m(cache_dir, key, a3m)
+            fetched[key] = a3m.count(">")
+    data_volume.commit()
+
+    return {
+        "cache_dir": str(cache_dir),
+        "chains": {chain: keys[chain] for chain in sequences},
+        "already_cached": sorted(already),
+        "fetched_depths": fetched,
+        "host_url": msa.host_url,
+        "authenticated": msa.needs_secret,
+        "run_root": str(root),
+    }
+
+
+def _target_msa_paths(campaign, sequences: dict[str, str], work) -> dict[str, str]:
+    """Stage each target's cached a3m beside the input JSON, keyed by chain.
+
+    The kit reads `"msa"` as a path relative to the input JSON
+    (`esmfold2/README.md`), and its own example writes `"msas/B.a3m"`, so the
+    alignments are copied next to the JSON under that layout rather than
+    referenced in place on the volume.
+
+    Raises when one is missing. Holo without its target alignments would fold
+    the targets from sequence alone and still produce interface numbers, which
+    is the failure worth being loud about.
+    """
+    from rfd3_pipeline.msa import cache_key, read_cached_a3m
+
+    msa = campaign.msa
+    cache_dir = Path(DATA) / campaign.general.name_design_campaign / "msa_cache"
+    staged = work / "msas"
+    staged.mkdir(parents=True, exist_ok=True)
+
+    paths: dict[str, str] = {}
+    missing: list[str] = []
+    for chain, sequence in sequences.items():
+        key = cache_key(sequence, use_env=msa.use_env, use_filter=msa.use_filter)
+        a3m = read_cached_a3m(cache_dir, key)
+        if a3m is None:
+            missing.append(f"{chain} ({key})")
+            continue
+        (staged / f"{chain}.a3m").write_text(a3m)
+        paths[chain] = f"msas/{chain}.a3m"
+
+    if missing:
+        raise RuntimeError(
+            f"no cached MSA for target chain(s) {', '.join(missing)} under "
+            f"{cache_dir}. Run `modal run app.py::cache_msas --campaign <file>` "
+            f"first; folding holo without them would score the binder against "
+            f"targets built from sequence alone."
+        )
+    return paths
+
+
+# ---------------------------------------------------------------------------
 # Refolding (apo and holo)
 # ---------------------------------------------------------------------------
 # Stage name -> (include_targets, supplies_msa). The two stages differ only in
@@ -661,7 +811,7 @@ def _refold(seq_ids: list[str], campaign_payload: dict, stage: str) -> dict:
     """
     import json
 
-    from rfd3_pipeline.config import folding_variant
+    from rfd3_pipeline.config import MODEL_CAPABILITIES, folding_variant
     from rfd3_pipeline.gates import Stage
     from rfd3_pipeline.report import read_shards, write_shard
 
@@ -677,6 +827,7 @@ def _refold(seq_ids: list[str], campaign_payload: dict, stage: str) -> dict:
     work = Path("/tmp") / stage
     work.mkdir(parents=True, exist_ok=True)
 
+    msa_paths: dict[str, str] = {}
     variant = folding_variant(refolding.model, supplies_msa)
     if variant is None:
         raise ValueError(
@@ -706,6 +857,11 @@ def _refold(seq_ids: list[str], campaign_payload: dict, stage: str) -> dict:
         # score the binder on a complex it was not designed for.
         ligands = _ligand_entries(campaign, load_structure(resolved.structure_path))
 
+        # Staged only when the model actually reads them, so an esmfold2-fast
+        # campaign neither needs a cache nor trips the missing-cache error.
+        if MODEL_CAPABILITIES[refolding.model].msa_unpaired:
+            msa_paths = _target_msa_paths(campaign, target_sequences, work)
+
     items, prepared, skipped = [], [], []
     for seq_id in seq_ids:
         record = by_seq.get(seq_id)
@@ -730,11 +886,11 @@ def _refold(seq_ids: list[str], campaign_payload: dict, stage: str) -> dict:
                         "type": "protein",
                         "id": chain,
                         "sequence": target_sequences[chain],
-                        # Set explicitly even when empty: `fill_missing_msas`
-                        # gates the unpaired and paired queries on *different*
-                        # fields, so leaving either as null sends the sequence
-                        # out. The target MSA cache fills this in when built.
-                        "msa": None,
+                        # A path relative to this JSON, or None when the model
+                        # reads no alignments. The binder above stays None
+                        # whatever the model: a de novo binder has no homologs,
+                        # and this is what keeps its sequence off the network.
+                        "msa": msa_paths.get(chain),
                     }
                 )
 
@@ -1073,7 +1229,7 @@ def orchestrate(campaign_payload: dict, start_at: str = "rfd3", chunk_size: int 
     print(f"orchestrate: start_at={start_at}, {len(rfd3.specs)} spec(s)", flush=True)
 
     root = Path(_run_root(campaign))
-    stages = Stage.ORDER[: Stage.ORDER.index(Stage.APO) + 1]
+    stages = Stage.ORDER[: Stage.ORDER.index(Stage.HOLO) + 1]
     if start_at not in stages:
         raise ValueError(f"start_at must be one of {list(stages)}, got {start_at!r}")
     reached = stages.index(start_at)
@@ -1158,27 +1314,53 @@ def orchestrate(campaign_payload: dict, start_at: str = "rfd3", chunk_size: int 
             f"have {sorted(REFOLD_FUNCTIONS)}. Add an image and a wrapper."
         )
 
-    # Apo folds the binder alone, so its chunks are sized by the refolding
-    # config rather than the design chunk_size.
-    apo_chunks = [
-        sequences[i : i + refolding.chunk_size]
-        for i in range(0, len(sequences), refolding.chunk_size)
-    ]
-    print(
-        f"phase apo: {len(sequences)} sequence(s), {len(apo_chunks)} chunk(s) "
-        f"of up to {refolding.chunk_size}, max_concurrent="
-        f"{refolding.max_concurrent}",
-        flush=True,
-    )
-    if apo_chunks:
-        report["apo"] = list(
-            refold.with_options(
-                gpu=refolding.gpu, max_containers=refolding.max_concurrent
-            ).map(
-                apo_chunks,
-                kwargs={"campaign_payload": campaign_payload, "stage": "apo"},
-            )
+    def refold_chunks(ids: list[str]) -> list[list[str]]:
+        """Sized by the refolding config, not the design `chunk_size`: a fold
+        amortises ~180 s of process start-up, so the right batch is different."""
+        size = refolding.chunk_size
+        return [ids[i : i + size] for i in range(0, len(ids), size)]
+
+    def run_stage(stage: str, ids: list[str]) -> None:
+        chunks = refold_chunks(ids)
+        print(
+            f"phase {stage}: {len(ids)} sequence(s), {len(chunks)} chunk(s) of "
+            f"up to {refolding.chunk_size}, max_concurrent="
+            f"{refolding.max_concurrent}",
+            flush=True,
         )
+        if chunks:
+            report[stage] = list(
+                refold.with_options(
+                    gpu=refolding.gpu, max_containers=refolding.max_concurrent
+                ).map(
+                    chunks,
+                    kwargs={"campaign_payload": campaign_payload, "stage": stage},
+                )
+            )
+
+    # Gated like every other phase. An ungated one is invisible until a stage
+    # exists beyond it -- which is exactly how the MPNN phase came to re-run on
+    # `--start-at apo`.
+    if reached <= stages.index(Stage.APO):
+        run_stage("apo", sequences)
+
+    if reached <= stages.index(Stage.HOLO):
+        # Holo takes apo's survivors, not every sequence. Apo folds one chain
+        # and holo folds the whole complex, so apo is the cheap filter that
+        # should spend holo's budget only on sequences that folded as designed.
+        data_volume.reload()
+        survivors = _passing_sequences(root, "apo")
+        report["n_passing_apo"] = len(survivors)
+        if not survivors and sequences:
+            # Loud, because the alternative is a holo phase that silently does
+            # nothing and a summary with no holo columns at all.
+            print(
+                f"phase holo: SKIPPED -- 0 of {len(sequences)} sequences passed "
+                f"apo (threshold_plddt_binder={refolding.threshold_plddt_binder}). "
+                f"Nothing to fold.",
+                flush=True,
+            )
+        run_stage("holo", survivors)
 
     print("phase reduce", flush=True)
     report["reduce"] = reduce_summaries.remote(campaign_payload)
@@ -1198,6 +1380,22 @@ def _sequence_ids(root) -> list[str]:
         record["seq_id"]
         for record in read_shards(root / "shards")
         if record.get("seq_id") and record.get("sequence")
+    )
+
+
+def _passing_sequences(root, stage: str) -> list[str]:
+    """Sequence ids whose shard says they passed `stage`.
+
+    Read from the shards rather than from the stage's return value, so
+    restarting at a later stage selects exactly the set a continuous run would.
+    """
+    from rfd3_pipeline.report import read_shards
+
+    flag = f"{stage}_pass"
+    return sorted(
+        record["seq_id"]
+        for record in read_shards(root / "shards")
+        if record.get("seq_id") and record.get(flag) is True
     )
 
 
@@ -1313,6 +1511,73 @@ def install_mpnn_weights():
 @app.local_entrypoint()
 def warm_esm_jit():
     _show(install_esm_jit.remote())
+
+
+@app.local_entrypoint()
+def refold_only(campaign: str, stage: str = "apo", dry_run: bool = False, limit: int = 0):
+    """Run one refolding stage over the sequences already on the volume.
+
+    For exercising a stage on its own, before or instead of wiring it into
+    `orchestrate`. `--limit N` takes the first N sequences, which is how a new
+    stage gets tried on one input rather than on all of them.
+    """
+    payload, _, _ = _prepare(campaign, dry_run=dry_run)
+    _show(_refold_one_stage.remote(payload, stage=stage, limit=limit))
+
+
+@app.function(image=cpu_image, volumes=VOLUMES, timeout=24 * HOUR)
+def _refold_one_stage(campaign_payload: dict, stage: str, limit: int = 0) -> dict:
+    """Pick the sequences and dispatch one stage, remotely.
+
+    A thin coordinator rather than part of `refold_only`, so the client is not
+    in the control flow for a long fold.
+    """
+    data_volume.reload()
+
+    campaign = _campaign_from(campaign_payload)
+    refolding = campaign.refolding
+    root = Path(_run_root(campaign))
+    sequences = _sequence_ids(root)
+    if limit:
+        sequences = sequences[:limit]
+
+    refold = REFOLD_FUNCTIONS.get(refolding.model.value)
+    if refold is None:
+        raise ValueError(
+            f"no refold function for model {refolding.model.value!r}; "
+            f"have {sorted(REFOLD_FUNCTIONS)}"
+        )
+
+    chunks = [
+        sequences[i : i + refolding.chunk_size]
+        for i in range(0, len(sequences), refolding.chunk_size)
+    ]
+    print(
+        f"phase {stage}: {len(sequences)} sequence(s), {len(chunks)} chunk(s) "
+        f"of up to {refolding.chunk_size}",
+        flush=True,
+    )
+    if not chunks:
+        return {"stage": stage, "n_sequences": 0}
+
+    results = list(
+        refold.with_options(
+            gpu=refolding.gpu, max_containers=refolding.max_concurrent
+        ).map(chunks, kwargs={"campaign_payload": campaign_payload, "stage": stage})
+    )
+    return {"stage": stage, "n_sequences": len(sequences), stage: results}
+
+
+@app.local_entrypoint()
+def cache_msas(campaign: str, dry_run: bool = False, force: bool = False):
+    """Build the target MSA cache for a campaign, once.
+
+    Separate from `run` because it is the one step that leaves the network, and
+    because it is campaign-scoped rather than per run -- so it should be
+    possible to do it deliberately and inspect the result before any folding.
+    """
+    payload, _, _ = _prepare(campaign, dry_run=dry_run)
+    _show(build_msa_cache.remote(payload, force=force))
 
 
 @app.local_entrypoint()
