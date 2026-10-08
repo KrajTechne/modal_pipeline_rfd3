@@ -287,6 +287,20 @@ def run_rfd3(spec_name: str, campaign_payload: dict) -> dict:
         "skip_existing=True",
         "dump_prediction_metadata_json=True",
     ]
+    if rfd3.seed is not None:
+        # Top-level `seed`, not `inference_engine.seed`: `inference.yaml`
+        # selects `inference_engine: rfdiffusion3`, and that option is
+        # `@package _global_` inheriting `base`, so base's `seed` merges at the
+        # root beside `out_dir` and `n_batches`. Verified by composing the
+        # config as `rfd3/cli.py` does -- the nested form is refused with
+        # "Could not override", and Hydra's suggested `+inference_engine.seed=`
+        # would be worse: it sets a key nothing reads, leaving sampling
+        # unseeded while looking configured.
+        #
+        # Upstream's default is `seed: null`, so passing nothing means unseeded
+        # -- which is why two runs of an identical campaign produced different
+        # backbones. Appended only when set, so a full campaign keeps that.
+        command.append(f"seed={rfd3.seed}")
     print(f"rfd3 design: spec {spec_name} in {root}", flush=True)
     returncode, output_tail = _stream(command, timeout=6 * HOUR, cwd=str(root))
     data_volume.commit()

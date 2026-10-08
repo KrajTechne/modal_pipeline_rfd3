@@ -361,6 +361,16 @@ class Rfd3Config(_Base):
     # carrying one is rejected loudly rather than silently believed.
     length: str | None = None
 
+    # Top-level `seed` in RFD3's composed config, whose own default is `null`
+    # (`configs/inference_engine/base.yaml`, merged at the root because the
+    # engine option is `@package _global_`) -- so unseeded sampling is
+    # upstream's behaviour, not an omission here. Left None at full scale on
+    # purpose: once a dry run has shown the workflow sound, diverse backbones
+    # across a campaign are the point. Set it to make a run repeatable, which
+    # is what a dry run needs and what a controlled sampler comparison
+    # requires -- `step_scale=3` against stock cannot be attributed if the
+    # backbones differ between runs too.
+    seed: int | None = None
     n_batches: int = Field(default=1, ge=1)
     diffusion_batch_size: int = Field(default=8, ge=1)
 
@@ -581,9 +591,24 @@ DRY_RUN_SUFFIX = "-dryrun"
 DRY_RUN_OVERRIDES: dict[str, dict[str, Any]] = {
     # Three designs rather than two: enough that the backbone filters can both
     # pass and fail within one run, which two cannot reliably do.
+    # `seed` is not here: it is derived from `general.base_seed` in
+    # `apply_dry_run`, so a campaign that sets a base seed gets that one rather
+    # than a literal pinned in this table.
     "rfdiffusion3": {"n_batches": 1, "diffusion_batch_size": 3, "max_concurrent": 1},
     "mpnn": {"num_seqs": 2, "max_concurrent": 1},
-    "refolding": {"model": "esmfold2", "mode": "fast", "max_concurrent": 1},
+    "refolding": {
+        "model": "esmfold2",
+        "mode": "fast",
+        "max_concurrent": 1,
+        # The apo gate, because at smoke scale it otherwise blocks the last
+        # two stages entirely: two sequences per backbone at temperature 0.1
+        # are weak designs, and every one failed 70 while one of them still
+        # reproduced its backbone to 1.31 A. A dry run exists to exercise the
+        # pipeline's shape, so a gate that stops it before holo defeats that --
+        # and lowering the real threshold to make a smoke test pass would be
+        # the wrong fix.
+        "threshold_plddt_binder": 40.0,
+    },
     "cross_validation": {"num_seeds": 1, "max_concurrent": 1},
 }
 
@@ -607,6 +632,16 @@ def apply_dry_run(payload: dict[str, Any]) -> dict[str, Any]:
     specs = merged.get("rfdiffusion3", {}).get("specs") or []
     if specs:
         merged["rfdiffusion3"] = {**merged["rfdiffusion3"], "specs": specs[:1]}
+
+    # Seed RFD3 for a dry run, derived from the campaign's base seed rather
+    # than pinned in DRY_RUN_OVERRIDES so a campaign that sets one gets its
+    # own. A smoke test has to be repeatable to be worth comparing against; a
+    # full campaign deliberately leaves this None, because once the workflow is
+    # known sound, diverse backbones are the point. An explicit seed in the
+    # campaign is respected rather than overwritten.
+    if "rfdiffusion3" in merged and merged["rfdiffusion3"].get("seed") is None:
+        base_seed = (payload.get("general") or {}).get("base_seed", 0)
+        merged["rfdiffusion3"] = {**merged["rfdiffusion3"], "seed": base_seed}
 
     general = dict(merged.get("general", {}))
     run_name = str(general.get("run_name", "run"))

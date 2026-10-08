@@ -113,7 +113,7 @@ refolding:
   # both under esmfold2-fast, where a target MSA would be ignored).
   model: esmfold2
   mode: fast                     # off | exact | fast | big
-  gpu: A100-80GB                 # the kit --config card is derived from this
+  gpu: A100-40GB                 # the kit --config card is derived from this
   n_gpu_shard: 1                 # >1 only under mode: big (2|4|8)
   max_concurrent: 4              # Modal containers (was `n_gpu`)
   chunk_size: 24                 # sequences per container; amortizes model load

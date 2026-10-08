@@ -187,6 +187,62 @@ Commercially relevant: the official weights carry a non-commercial restriction.
 
 ## 4. RFD3 design (GPU)
 
+### The seed is top-level `seed`, and it only goes so far
+
+**Unseeded is upstream's default.** [verified 2026-10-08] RFD3's composed config
+has `seed: None`, so passing nothing means every run samples differently -- two
+runs of a byte-identical campaign produced different backbones, which is what
+exposed this.
+
+**The override is `seed=N`, not `inference_engine.seed=N`.** The nested form is
+*refused*:
+
+    ConfigCompositionException: Could not override 'inference_engine.seed'.
+    To append to your config use +inference_engine.seed=0
+
+`seed: null` is written in `configs/inference_engine/base.yaml`, but
+`configs/inference.yaml` selects `inference_engine: rfdiffusion3`, and that
+option is `@package _global_` inheriting `base` -- so the key merges at the
+*root*, beside `out_dir`, `n_batches` and `inference_sampler`. Confirmed by
+composing the config the way `rfd3/cli.py` does; the key's location in the
+source tree is not where it ends up.
+
+**Do not take Hydra's `+` suggestion.** `+inference_engine.seed=0` would be
+accepted and set a key nothing reads, leaving sampling unseeded while looking
+configured. Worse than the error. Where a key lives has to be read off the
+*composed* config, not grepped out of the tree.
+
+**A seed fixes the discrete sampling, not the diffusion trajectory.** [verified
+2026-10-08] Two seeded runs gave the same binder length and the same motif
+placements, against an unseeded run that differed in both:
+
+| | binder length | motif offsets |
+|---|---|---|
+| unseeded | 118 | A17, A46, A63 |
+| seeded A | 108 | A70, A89 |
+| seeded B | 108 | A70, A89 |
+
+But the geometry diverged -- `bb_rg` 12.63 against 12.40, `bb_loop_fraction`
+0.295 against 0.324 -- and the MPNN sequences differ entirely as a consequence,
+because MPNN is designing against a different backbone rather than being
+unseeded itself. Over `num_timesteps: 200`, non-deterministic CUDA reductions
+amplify into Angstrom-scale differences. Accepted: chasing bit-exactness would
+mean forcing deterministic algorithms inside RFD3, which this pipeline does not
+control and which costs speed.
+
+**So a dry run is reproducible in shape, not in numbers.** The same code paths
+get exercised -- same design count, lengths and motif placements -- while the
+metrics move. For a sampler comparison (`step_scale=3` against stock), compare
+*distributions* over several designs rather than diffing two runs; a two-run
+diff cannot attribute the difference.
+
+**Seeded for dry runs, unseeded at full scale.** `Rfd3Config.seed` defaults to
+None and `apply_dry_run` sets it from `general.base_seed`. Once a dry run has
+shown the workflow sound, diverse backbones across a campaign are the point. A
+campaign that pins its own seed keeps it.
+
+### Everything else
+
 **Never use `capture_output=True` for the design subprocess.** [verified
 2026-10-07] It holds every line in a pipe until exit, so a six-hour job is
 completely silent, and a `returncode: 1` gets reported into a dict while the
