@@ -693,11 +693,18 @@ def _refold(seq_ids: list[str], campaign_payload: dict, stage: str) -> dict:
     # Target sequences come from the input structure once per campaign, not from
     # the shards -- they are identical for every prediction.
     target_sequences: dict[str, str] = {}
+    ligands: list[dict] = []
     if include_targets:
         from rfd3_pipeline.spec import resolve_campaign
+        from rfd3_pipeline.structure import load_structure
 
         resolved = resolve_campaign(campaign, structure_root=DATA)
         target_sequences = dict(resolved.target_sequences)
+        # The ligand belongs in holo: RFD3 designed against it, and the
+        # backbone filters already measure `bb_ligand_clashes` and
+        # `bb_ligand_min_distance` against it. Folding holo without it would
+        # score the binder on a complex it was not designed for.
+        ligands = _ligand_entries(campaign, load_structure(resolved.structure_path))
 
     items, prepared, skipped = [], [], []
     for seq_id in seq_ids:
@@ -731,6 +738,8 @@ def _refold(seq_ids: list[str], campaign_payload: dict, stage: str) -> dict:
                     }
                 )
 
+        chains.extend(ligands)
+
         # `id` names the output file, so the result is directly addressable.
         items.append(
             {
@@ -760,7 +769,11 @@ def _refold(seq_ids: list[str], campaign_payload: dict, stage: str) -> dict:
         "--seeds", str(campaign.general.base_seed),
         "--det", "1",
     ]
-    print(f"{stage}: {len(prepared)} sequence(s), variant {variant}", flush=True)
+    print(
+        f"{stage}: {len(prepared)} sequence(s), variant {variant}"
+        + (f", ligand chains {[entry['id'] for entry in ligands]}" if ligands else ""),
+        flush=True,
+    )
     returncode, output_tail = _stream(command, timeout=4 * HOUR, cwd=ESM_KIT)
 
     # Exit 3 is the kit refusing to engage a mode, by name, rather than falling
@@ -806,6 +819,64 @@ def _refold(seq_ids: list[str], campaign_payload: dict, stage: str) -> dict:
         "skipped": skipped,
         "output_tail": output_tail,
     }
+
+
+def _ligand_entries(campaign, structure) -> list[dict]:
+    """The input JSON's ligand chains, derived rather than named in code.
+
+    `rfd3.ligand` is a reference into the input structure -- `"E703"` means
+    chain E, residue 703 -- so both the chain id and the CCD code come from
+    there. Hardcoding either would be wrong in a way that is hard to see: this
+    campaign's input holds MN in *two* chains, one in D at residue 1004 and
+    three in E at 703-705, and names only E703. Lettering the ligand "after the
+    protein chains" would land on D, a different ion the campaign does not use,
+    at an unrelated residue number.
+
+    The chain id must also match what RFD3 emitted, since the structural
+    comparisons pair on `(chain, res_id)`. RFD3 preserves the input letter --
+    observed 2026-10-07, output chains `A/B/C/E` -- which is what this relies
+    on.
+
+    Shape from `opt/esmfold2_opt/inputs.py:7-9`: `{"type": "ligand", "id": ...,
+    "ccd": [...]}`, with no `sequence` (`inputs.py:63`).
+
+    **One ion only.** ESMFold2 takes a single ligand component here, not a chain
+    of them, so more than one configured ligand residue raises rather than
+    folding against a subset. Note this is a *refolding* limit, not a config
+    error: RFD3 can legitimately be given the whole chain-E triad, and such a
+    campaign would be valid right up to holo. That is why the check lives here
+    rather than in the schema -- but it does mean the failure arrives after RFD3
+    and MPNN have already run.
+    """
+    from rfd3_pipeline.contig import parse_residue_selection
+
+    if not campaign.rfdiffusion3.ligand:
+        return []
+
+    selection = parse_residue_selection(campaign.rfdiffusion3.ligand)
+    if len(selection) > 1:
+        named = ",".join(f"{chain}{res_id}" for chain, res_id in selection)
+        raise ValueError(
+            f"rfd3.ligand names {len(selection)} residues ({named}), and "
+            f"refolding can represent one ligand component. Folding against a "
+            f"subset would score the binder on a complex it was not designed "
+            f"for, so name a single residue or split the stage."
+        )
+
+    chain, res_id = selection[0]
+    selected = structure[(structure.chain_id == chain) & (structure.res_id == res_id)]
+    names = sorted({str(name) for name in selected.res_name})
+    if not names:
+        raise ValueError(
+            f"ligand {chain}{res_id} is not in the input structure; "
+            f"rfd3.ligand names a residue that does not exist"
+        )
+    if len(names) > 1:
+        raise ValueError(
+            f"ligand {chain}{res_id} resolves to several residue names "
+            f"{names}; one position cannot be more than one component"
+        )
+    return [{"type": "ligand", "id": chain, "ccd": [names[0]]}]
 
 
 def _pred_rows(path) -> dict:

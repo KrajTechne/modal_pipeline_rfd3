@@ -557,11 +557,27 @@ What holo needs instead:
    for this campaign. The binder never needs an alignment here, so the
    sensitive sequences stay in-house by construction rather than by
    suppression.
-2. **The chain-E ligand.** `_refold` currently assembles binder plus protein
-   targets only, so holo as written would fold against a complex missing the
-   metal that RFD3 designed around and that the backbone filters measure
-   (`bb_ligand_clashes`, `bb_ligand_min_distance`). ESMFold2 does take ligands;
-   see section 8 for the entry shape.
+2. **The chain-E ligand** -- done, but with a limit to know about. `_refold`
+   now derives the entry from `rfd3.ligand` plus the input structure, because
+   neither the chain letter nor the CCD code is guessable:
+
+   ```
+   input structure:  chain D  res 1004  MN
+                     chain E  res 703, 704, 705  MN
+   rfd3.ligand: "E703"  ->  {"type": "ligand", "id": "E", "ccd": ["MN"]}
+   ```
+
+   "The chain after the protein chains" would be **D** -- a different ion the
+   campaign does not use, at an unrelated residue number. And the chain letter
+   has to match RFD3's output anyway, since the structural comparisons pair on
+   `(chain, res_id)`.
+
+   **ESMFold2 takes one ligand component, not a chain of them.** More than one
+   configured ligand residue raises rather than folding against a subset. This
+   is a *refolding* limit, not a config error -- RFD3 can legitimately be given
+   the whole chain-E triad, so such a campaign validates and runs through RFD3
+   and MPNN before failing at holo. Anyone splitting the metals for RFD3 needs
+   to know that; it is not enforced at config time on purpose.
 3. **What a3m shape `full_msa` expects** -- query first? -- and whether it
    tolerates a mix of chains with and without an `msa` path. Both unverified.
 
