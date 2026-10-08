@@ -419,11 +419,38 @@ portable kernels serve. Informational, not failure.
 `MODEL_OPT_JIT_ROOT` on the jit volume. Containers are ephemeral, so without it
 every prediction pays a cold compile.
 
-**Input is upstream's prediction-input JSON**: a *list* of items, each
-`{"id", "sequences": [{"type", "id", "sequence", "msa"}], "seeds",
+**Input is upstream's prediction-input JSON**, documented in the kit at
+`opt/esmfold2_opt/inputs.py:7-9` -- read that rather than the example file,
+which contains protein chains only and misleads:
+
+```json
+"sequences": [
+  {"type": "protein", "id": "A", "sequence": "...", "msa": null},
+  {"type": "protein", "id": "B", "sequence": "...", "msa": "msas/B.a3m"},
+  {"type": "ligand",  "id": "L1", "ccd": ["ATP"]}
+]
+```
+
+Top level is a *list* of items, each `{"id", "sequences", "seeds",
 "num_diffusion_samples"}`. `id` names the output file, so setting it to `seq_id`
 makes results directly addressable. `--input` takes the list, which is what
 makes `chunk_size` worth having.
+
+**Four chain types: `protein|rna|dna|ligand`** (`inputs.py:62`). Non-ligand
+chains need a `sequence`; ligands take `ccd` (a list of CCD codes) or `smiles`
+instead (`inputs.py:63`). So **ESMFold2 does take ligands** -- the alphaV/beta3
+campaign's chain-E metal belongs in a holo input as
+`{"type": "ligand", "id": "E", "ccd": ["MN"]}`.
+
+**`msa` is the kit's extension, not upstream's field** -- the source calls it
+"the package's one extension" (`inputs.py:8`).
+
+**There is exactly one MSA field per chain, and one MSA CLI flag.**
+`--msa_max_depth` (default 1024, `report.py:622`) is the per-recycle row draw
+under `msa_subsample_at_inference`, not a hard truncation. An alignment deeper
+than it also makes the `mh` lever inert (`modes.py:124-125`), which is reported
+on the lever line -- so a3m depth is a performance knob as well as a quality
+one.
 
 **Output** is `<out_dir>/cif_all/<id>__<fast|full>__s<seed>_x<k>.cif` plus
 `..._pae.npz`, and an appended `pred_rows.jsonl`. The token is `fast`/`full`,
@@ -508,9 +535,35 @@ need holo.
 
 Recorded now because the traps are already known and all are the silent kind.
 Verified against upstream source rather than docs, dated per item -- most on
-2026-09-28, the `msa_server.py` mechanics on 2026-10-07. Re-check if those repos
-move. Worth reading *before* holo is written rather than after: the egress trap
-below is the reason this section exists.
+2026-09-28, the `msa_server.py` mechanics on 2026-10-07.
+
+### Which stage each trap belongs to
+
+**Corrected 2026-10-08.** Everything below about `--use_msa_server`,
+`fill_missing_msas`, the two independent suppression gates, the `len > 1`
+pairing threshold and the discarded-paired-results bug is **AF3-fork
+mechanics**, so it applies to **cross-validation** (`cross_validation.model`
+is `af3_jax`) and **not** to holo.
+
+**The ESMFold2 kit contacts no MSA server at all** -- no `use_msa_server`,
+`msa_server`, ColabFold or MMseqs reference anywhere in its Python, shell or
+docs. It reads an a3m you hand it, or folds without one. So for holo on
+`esmfold2` there is no automatic egress to disarm.
+
+What holo needs instead:
+
+1. **Target a3m files, built by us.** The kit will not fetch them. The egress
+   is our own client's, and only over **target** sequences -- public proteins
+   for this campaign. The binder never needs an alignment here, so the
+   sensitive sequences stay in-house by construction rather than by
+   suppression.
+2. **The chain-E ligand.** `_refold` currently assembles binder plus protein
+   targets only, so holo as written would fold against a complex missing the
+   metal that RFD3 designed around and that the backbone filters measure
+   (`bb_ligand_clashes`, `bb_ligand_min_distance`). ESMFold2 does take ligands;
+   see section 8 for the entry shape.
+3. **What a3m shape `full_msa` expects** -- query first? -- and whether it
+   tolerates a mix of chains with and without an `msa` path. Both unverified.
 
 **`sokrypton/alphafold3 --use_msa_server` does not cache, despite its help text
 saying results are cached in `--cache_dir`.** `run_alphafold.py:1728` calls
@@ -526,12 +579,35 @@ Before any of the MSA machinery matters, check the model. The table is
 conditionals, and a missing field is a `KeyError` at import rather than a silent
 fall-through. As of 2026-10-07:
 
-| model | consumes_msa | templates | seeds | weights | variant (no-msa / msa) |
-|---|---|---|---|---|---|
-| `esmfold2` | **yes** | no | `--seeds a,b,c` | -- | `full_nomsa` / `full_msa` |
-| `esmfold2-fast` | **no** | no | `--seeds a,b,c` | -- | `fast` / `fast` |
-| `boltz2` | **yes** | no *[unconfirmed]* | `--seeds a,b,c` | -- | none / none |
-| `af3_jax` | **yes** | yes | `--num_seeds N` | `openfold3` | `p2` / `p2` |
+| model | unpaired | paired | templates | seeds | weights | variant (no-msa / msa) |
+|---|---|---|---|---|---|---|
+| `esmfold2` | yes | **no** | no | `--seeds a,b,c` | -- | `full_nomsa` / `full_msa` |
+| `esmfold2-fast` | no | no | no | `--seeds a,b,c` | -- | `fast` / `fast` |
+| `boltz2` | yes | **no** *[unverified]* | no *[unverified]* | `--seeds a,b,c` | -- | none / none |
+| `af3_jax` | yes | **yes** | yes | `--num_seeds N` | `openfold3` | `p2` / `p2` |
+
+`consumes_msa` is **derived** from the two MSA flags (`msa_unpaired or
+msa_paired`), not stored, so it cannot contradict them. `msa_paired` requires
+`msa_unpaired`, checked at import: pairing refines per-chain alignments rather
+than replacing them.
+
+**`msa_paired` is the column that decides whether the cache needs a paired
+path at all.** It says the *caller* must do the pairing. ESMFold2 takes a single
+a3m per chain and pairs internally, so for an esmfold2 refolding stage the
+answer is no -- which is why only unpaired alignments are worth caching. The AF3
+fork takes `unpaired_msa` and `paired_msa` separately, so cross-validation is
+the stage that needs paired alignments built.
+
+The practical trap: applying the fork's two-field mechanics to an ESMFold2 input
+writes a key its schema has no place for. Silently ignored, while looking
+configured.
+
+**boltz2's `msa_paired=False` is unverified, and note the asymmetry** with its
+`supports_templates=False` above. There, `False` prevents a campaign silently
+requesting something that would be dropped. Here, `False` risks silently
+*under*-supplying: if boltz2 does want paired alignments we would never build
+them and the predictions would be quietly weaker rather than refused. Same
+conservative-looking value, opposite failure direction.
 
 **On `esmfold2-fast` there is no MSA step and no egress risk** -- nothing below
 is reachable. Apo and holo then differ only by which chains are in the input.

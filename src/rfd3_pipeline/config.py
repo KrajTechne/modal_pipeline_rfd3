@@ -112,13 +112,46 @@ class ModelCapabilities:
     """What one folding model supports. One row per model, no conditionals."""
 
     supports_templates: bool
-    consumes_msa: bool
+    # Which MSA fields a protein chain carries in this model's input, which is
+    # what the caller has to write. Two flags rather than one enum because the
+    # question at assembly time is per-field ("emit an unpaired one? a paired
+    # one?"), and because a campaign can then ask whether *any* of its models
+    # needs paired alignments without pattern-matching an enum.
+    #
+    # `msa_paired` is the one that says the caller must do the pairing itself.
+    # ESMFold2 takes a single a3m per chain and pairs internally; the AF3 fork
+    # takes `unpaired_msa` and `paired_msa` separately. That difference decides
+    # whether the MSA cache has to build paired alignments at all -- and paired
+    # alignments are not cacheable in general, being a property of the set of
+    # chains queried together rather than of one sequence.
+    msa_unpaired: bool
+    msa_paired: bool
     seed_style: SeedStyle
     # Keyed by whether the step supplies an MSA. None when the model's variant
     # is not derived per step.
     derived_variants: dict[bool, str] | None = None
     fixed_variant: str | None = None
     default_weights: Weights | None = None
+
+    def __post_init__(self) -> None:
+        # Pairing is a refinement of per-chain alignments, so paired-without-
+        # unpaired is not a shape any of these models offers. Checked at import,
+        # in keeping with the table's habit of failing on a bad row rather than
+        # letting it through.
+        if self.msa_paired and not self.msa_unpaired:
+            raise ValueError(
+                "msa_paired requires msa_unpaired: a model that takes paired "
+                "alignments also takes the per-chain ones they refine"
+            )
+
+    @property
+    def consumes_msa(self) -> bool:
+        """Derived, not stored, so it cannot contradict the two flags.
+
+        Storing it alongside them would allow `consumes_msa=True` with both
+        flags false, which nothing would catch.
+        """
+        return self.msa_unpaired or self.msa_paired
 
     @property
     def accepts_weights(self) -> bool:
@@ -135,13 +168,19 @@ MODEL_CAPABILITIES: dict[FoldingModel, ModelCapabilities] = {
     # names the model and the step supplies the MSA (esmfold2/README.md:72-73).
     FoldingModel.ESMFOLD2: ModelCapabilities(
         supports_templates=False,
-        consumes_msa=True,
+        # One `"msa"` a3m path per chain (`opt/esmfold2_opt/inputs.py:7-9`);
+        # the model pairs internally, so the caller never supplies pairing.
+        msa_unpaired=True,
+        msa_paired=False,
         seed_style=SeedStyle.LIST,
         derived_variants={False: "full_nomsa", True: "full_msa"},
     ),
     FoldingModel.ESMFOLD2_FAST: ModelCapabilities(
         supports_templates=False,
-        consumes_msa=False,
+        # Reads no alignments at all, so `consumes_msa` derives to False and
+        # the whole MSA cache is inert for a campaign using it.
+        msa_unpaired=False,
+        msa_paired=False,
         seed_style=SeedStyle.LIST,
         derived_variants={False: "fast", True: "fast"},
     ),
@@ -149,12 +188,22 @@ MODEL_CAPABILITIES: dict[FoldingModel, ModelCapabilities] = {
         # Templates unverified against the kit; left False so a campaign cannot
         # silently request something that may be ignored.
         supports_templates=False,
-        consumes_msa=True,
+        msa_unpaired=True,
+        # UNVERIFIED, and note the asymmetry with `supports_templates` above:
+        # there, False prevents a silent drop. Here, False risks silently
+        # *under*-supplying -- if boltz2 does want paired alignments we would
+        # never build them, and the predictions would be quietly weaker rather
+        # than refused. Check this row against the kit before trusting it.
+        msa_paired=False,
         seed_style=SeedStyle.LIST,
     ),
     FoldingModel.AF3_JAX: ModelCapabilities(
         supports_templates=True,
-        consumes_msa=True,
+        # `unpaired_msa` and `paired_msa` are separate fields on each protein
+        # chain (`msa_server.py`), so the caller does the pairing. This is the
+        # row that makes the MSA cache need a paired path at all.
+        msa_unpaired=True,
+        msa_paired=True,
         seed_style=SeedStyle.COUNT,
         fixed_variant="p2",
         default_weights=Weights.OPENFOLD3,
