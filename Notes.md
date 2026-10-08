@@ -212,6 +212,24 @@ accepted and set a key nothing reads, leaving sampling unseeded while looking
 configured. Worse than the error. Where a key lives has to be read off the
 *composed* config, not grepped out of the tree.
 
+**It is a real argument, just an undocumented one.** It appears in neither the
+foundry documentation nor `rfd3 design --help` -- Hydra config keys never show
+up in argparse help -- so its absence from the docs is not evidence against it.
+What establishes it:
+
+* Hydra's struct mode *refuses* unknown paths, which is why
+  `inference_engine.seed=0` failed. An unknown top-level key would be refused
+  the same way, so `seed=0` being accepted means the key genuinely exists in
+  the composed config.
+* **RFD3 records the seed it used in every design's metadata JSON.** The
+  checked-in fixture from an unseeded run reads `seed: None`; a run passing
+  `seed=0` reads `seed: 0`. The engine reads the key rather than merely
+  tolerating it.
+
+**That output field is the cheap post-hoc check**: read `seed` from any
+`rfd3/out/<design>.json` to confirm a campaign actually ran with the seed you
+think it did, rather than trusting the command you believe you issued.
+
 **A seed fixes the discrete sampling, not the diffusion trajectory.** [verified
 2026-10-08] Two seeded runs gave the same binder length and the same motif
 placements, against an unseeded run that differed in both:
