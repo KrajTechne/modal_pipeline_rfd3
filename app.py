@@ -1230,12 +1230,6 @@ def _refold_metrics(seq_id, stage, row, out_dir, root, binder, campaign) -> dict
             metrics[f"{prefix}rmsd_to_design"] = None
             metrics[f"{prefix}rmsd_error"] = f"{type(error).__name__}: {error}"
 
-    # Only one gate is available from apo alone; the other two need both
-    # structures, so they are evaluated in the holo branch below.
-    plddt = metrics.get(f"{prefix}plddt_binder")
-    if stage == "apo" and plddt is not None:
-        metrics["apo_pass"] = plddt >= campaign.refolding.threshold_plddt_binder
-
     if stage == "holo":
         # Did binding change the fold? A binder whose apo and holo backbones
         # disagree was not folding into one shape, so its interface numbers
@@ -1255,25 +1249,16 @@ def _refold_metrics(seq_id, stage, row, out_dir, root, binder, campaign) -> dict
         else:
             metrics["holo_rmsd_apo_holo"] = None
 
-        # Both thresholds, and both must hold. Each is recorded next to its
-        # verdict: a row that says only `holo_pass: False` cannot be argued
-        # with, and these two gates decide whether the most expensive stage in
-        # the pipeline runs at all.
-        thresholds = campaign.refolding
-        iptm = metrics.get(f"{prefix}iptm")
-        drift = metrics.get("holo_rmsd_apo_holo")
-        checks = {
-            "holo_pass_iptm": None if iptm is None else iptm >= thresholds.threshold_ipTM,
-            "holo_pass_rmsd": (
-                None if drift is None else drift <= thresholds.threshold_rmsd_apo_holo
-            ),
-        }
-        metrics.update(checks)
-        # A missing measurement is not a pass. Unknown fails closed here
-        # because the next stage is cross-validation, and spending it on a
-        # sequence whose interface could not be measured buys nothing.
-        metrics["holo_pass"] = all(value is True for value in checks.values())
+    # The verdict is domain logic, not orchestration: it lives beside the gate
+    # declarations it applies, where it can be tested without Modal.
+    from rfd3_pipeline.gates import refold_verdict
+
+    metrics.update(refold_verdict(metrics, stage, campaign.refolding))
     return metrics
+
+
+
+
 
 
 @app.function(image=esmfold2_image, gpu="A100-40GB", volumes=VOLUMES, timeout=4 * HOUR)
@@ -1888,13 +1873,14 @@ def reduce_summaries(campaign_payload: dict) -> dict:
     """
     from pathlib import Path
 
-    from rfd3_pipeline.gates import Stage, backbone_gates
+    from rfd3_pipeline.gates import Stage, backbone_gates, refold_gates
     from rfd3_pipeline.report import latest_records, read_shards, write_summaries
 
     # Every shard was written by some other container.
     data_volume.reload()
 
     campaign = _campaign_from(campaign_payload)
+    rfd3 = campaign.rfdiffusion3
     root = Path(_run_root(campaign))
     shards = read_shards(root / "shards")
     # One row per sequence, plus the backbones that died before MPNN. Without
@@ -1907,8 +1893,27 @@ def reduce_summaries(campaign_payload: dict) -> dict:
         campaign=campaign.general.name_design_campaign,
         run_name=campaign.general.run_name,
         n_specs=len(campaign.rfdiffusion3.specs),
-        stage_gates={Stage.BACKBONE_FILTERS: backbone_gates(campaign.rfdiffusion3)},
+        # Every gated stage, not just the backbone filters. A stage missing
+        # from here is missing from the funnel, which is how the summary came
+        # to describe two stages out of six.
+        stage_gates={
+            Stage.BACKBONE_FILTERS: backbone_gates(campaign.rfdiffusion3),
+            Stage.APO: refold_gates(campaign.refolding, Stage.APO),
+            Stage.HOLO: refold_gates(campaign.refolding, Stage.HOLO),
+        },
         dry_run=campaign.run.dry_run,
+        # What the campaign asked for. The records cannot say whether three
+        # designs means "three were configured" or "the rest failed", and at
+        # dry-run scale those look identical.
+        requested={
+            "n_batches": rfd3.n_batches,
+            "diffusion_batch_size": rfd3.diffusion_batch_size,
+            "designs_per_spec": rfd3.designs_per_spec,
+            "total_designs": rfd3.total_designs,
+            "n_mpnn_seqs_per_design": campaign.mpnn.num_seqs,
+            "max_sequences": rfd3.total_designs * campaign.mpnn.num_seqs,
+            "n_cv_seeds": campaign.cross_validation.num_seeds,
+        },
     )
     data_volume.commit()
 
@@ -1924,6 +1929,12 @@ def reduce_summaries(campaign_payload: dict) -> dict:
     return {
         "n_records": len(records),
         "n_passing_backbone_filters": passing,
+        # Mirrors the funnel so the console says as much as the file does.
+        "n_passing": {
+            stage: sum(1 for r in records if r.get(f"{prefix}pass") is True)
+            for stage, prefix in (("apo", "apo_"), ("holo", "holo_"))
+        },
+        "n_cross_validated": sum(1 for r in records if r.get("cv_n_seeds_ok")),
         "dry_run": campaign.run.dry_run,
         "written": {name: str(path) for name, path in paths.items()},
     }

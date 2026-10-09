@@ -25,6 +25,8 @@ __all__ = [
     "backbone_gates",
     "evaluate_gates",
     "metric_rules",
+    "refold_gates",
+    "refold_verdict",
 ]
 
 Comparison = Literal["<=", ">="]
@@ -145,6 +147,93 @@ def backbone_gates(rfd3_config) -> tuple[Gate, ...]:
         Gate("rg_ratio", "<=", rfd3_config.threshold_radius_gyration_multiplier),
         Gate("hotspot_fraction", ">=", rfd3_config.threshold_hotspot_contacts),
     )
+
+
+def refold_gates(refolding_config, stage: str) -> tuple[Gate, ...]:
+    """The gates for one refolding stage, read from the `refolding` block.
+
+    Declared here rather than applied by hand in `app.py` for the reason this
+    module exists: the rules recorded in `summary.json` and the rules applied
+    to the data come from one declaration and cannot drift apart. The first
+    version of the holo gate restated its two thresholds in `app.py` and wrote
+    `holo_pass_iptm` instead of the `{metric}_pass` form the funnel counts, so
+    the per-metric failure counts silently stayed zero.
+
+    Apo gates on one metric and holo on two, which is a fact about what each
+    stage can measure, not a preference: apo folds the binder alone, so there
+    is no interface to score and no second structure to compare against.
+    """
+    if stage == Stage.APO:
+        return (
+            Gate("plddt_binder", ">=", refolding_config.threshold_plddt_binder),
+        )
+    if stage == Stage.HOLO:
+        return (
+            Gate("iptm", ">=", refolding_config.threshold_ipTM),
+            Gate("rmsd_apo_holo", "<=", refolding_config.threshold_rmsd_apo_holo),
+        )
+    # CV has no gates: nothing runs after it, so there is nothing to gate for.
+    # Its numbers inform ranking instead.
+    return ()
+
+
+def refold_verdict(
+    metrics: Mapping[str, object], stage: str, refolding_config
+) -> dict:
+    """This stage's gate columns, its verdict, and why it failed.
+
+    The counterpart to `evaluate_gates` for a refolding stage: it reads the
+    metrics the stage measured, applies `refold_gates`, and returns the columns
+    to merge into the record. Kept here rather than in `app.py` so the
+    thresholds, the column names and the verdict all come from one place --
+    the first version compared thresholds in `app.py` and wrote
+    `holo_pass_iptm` where the funnel counts `holo_iptm_pass`, which made every
+    per-metric failure count read zero while sequences were in fact failing.
+
+    Two deliberate departures from plain `evaluate_gates`:
+
+    **An unmeasured gate is a failure, not an error.** `evaluate_gates` raises
+    on a metric it cannot find, which is right when a missing value means a
+    bug. Holo's `rmsd_apo_holo` is legitimately absent when apo left no
+    structure behind, so that is settled here instead -- and settled as a
+    failure, because the stage after holo is the most expensive in the pipeline
+    and spending it on a sequence whose interface could not be measured buys
+    nothing.
+
+    **`fail_stage` and `fail_reasons` are unprefixed.** That is the pipeline's
+    cross-stage answer to "why did this design die", written by `filters.py`
+    since the backbone filters existed. A stage-specific
+    `holo_fail_reasons` would leave those two columns null on a holo failure,
+    so the one place a reader looks would say nothing.
+    """
+    gates = refold_gates(refolding_config, stage)
+    if not gates:
+        return {}
+
+    prefix = f"{stage}_"
+    values = {gate.metric: metrics.get(f"{prefix}{gate.metric}") for gate in gates}
+    unmeasured = sorted(metric for metric, value in values.items() if value is None)
+    if unmeasured:
+        return {
+            f"{prefix}pass": False,
+            "fail_stage": stage,
+            "fail_reasons": [f"{metric} not measured" for metric in unmeasured],
+        }
+
+    result = evaluate_gates(gates, values, prefix=stage)
+    columns: dict = {**result.columns, f"{prefix}pass": result.passed}
+    if not result.passed:
+        columns["fail_stage"] = stage
+        columns["fail_reasons"] = result.failures
+    elif metrics.get("fail_stage") == stage:
+        # Retract this stage's own earlier verdict, and only its own. A re-run
+        # that now passes must not leave the previous attempt's `fail_stage`
+        # behind -- the same stale-column problem `REFOLD_SUPERSEDES` solves
+        # for prefixed columns, which these two are not. Scoped to `== stage`
+        # so passing holo cannot erase a failure recorded earlier.
+        columns["fail_stage"] = None
+        columns["fail_reasons"] = []
+    return columns
 
 
 def metric_rules(gates: Iterable[Gate]) -> dict[str, str]:

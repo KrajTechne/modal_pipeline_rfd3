@@ -414,6 +414,61 @@ sequence row carries `design_id`, and `seq_id` is `{design_id}_seq{N}`; they sit
 adjacent in the leading columns. Group by `design_id` for a backbone's
 sequences. Do not add a third representation of the same relation.
 
+### A gate not declared in `gates.py` is a gate the funnel cannot see
+
+[found 2026-10-09] The holo gate was first written by comparing thresholds
+directly in `app.py`, which produced correct `holo_pass` verdicts and a
+`summary.json` that was quietly wrong in two ways at once. The columns came out
+as `holo_pass_iptm`, where `_funnel` counts `{prefix}{metric}_pass`, so every
+per-metric failure count stayed **zero** while two sequences were in fact
+failing. And the thresholds were then stated in two places, which is exactly
+what `gates.py` exists to prevent -- its own docstring says the rules recorded
+in the summary and the rules applied to the data must come from one
+declaration.
+
+So: a new gated stage declares its gates in `gates.py` (`refold_gates`
+alongside `backbone_gates`) and applies them through `evaluate_gates`, which
+names the columns, collects every failure rather than stopping at the first,
+and gives `fail_reasons` its human-readable form for free.
+
+One wrinkle worth knowing: `evaluate_gates` **raises** on a metric it cannot
+find, deliberately, because within a stage a missing gated value is a bug. But
+holo's `rmsd_apo_holo` is legitimately absent when apo left no structure, which
+is data rather than a bug -- so that case is settled before gating, and settled
+as a **failure**. Unknown fails closed, because the next stage is the most
+expensive in the pipeline.
+
+### The funnel's `n_in` was right only while one stage was gated
+
+[found 2026-10-09] `_funnel` selected `stage_reached == stage`. `stage_reached`
+records the *furthest* stage a design got to, so equality counts only what
+**stopped** there -- correct for a terminal stage, and `backbone_filters` was
+the only gated stage for months. The moment apo had survivors, apo reported
+`n_in: 0`. "Reached" has to mean *at or beyond*, by `Stage.ORDER` index.
+
+**And two units share one funnel.** `rfd3` and `backbone_filters` count
+*designs*; `mpnn` onward count *sequences*, because MPNN fans each surviving
+design into `num_seqs` of them. Counting rows for a design-unit stage reported
+five backbones entering the filters when three designs did -- the same
+double-counting `latest_records` fixes for the CSV, reappearing in the JSON.
+Each step now names its `unit`, because comparing the two as one number is the
+mistake this structure invites.
+
+**A stage with no gates reports `n_reported`, not `n_pass`/`n_fail`.** Nothing
+runs after cross-validation, so nothing can fail it; emitting `n_fail: 2` there
+read as "two designs failed cross-validation", which is false. Its numbers
+inform ranking instead.
+
+### `requested`: what the campaign asked for, beside what it got
+
+[added 2026-10-09] The records cannot tell you whether three designs means
+"three were configured" or "the rest failed", and at dry-run scale those are
+indistinguishable. So the summary carries `n_batches`,
+`diffusion_batch_size`, `designs_per_spec`, `total_designs`,
+`n_mpnn_seqs_per_design`, `max_sequences` (the product, i.e. the ceiling if
+nothing were filtered) and `n_cv_seeds`. All derived from the config, none
+re-typed.
+
 ---
 
 ## 8. Apo refolding, and the ESMFold2 kit
