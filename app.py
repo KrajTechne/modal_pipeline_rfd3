@@ -1479,14 +1479,14 @@ def _refold_metrics(
         apo_cifs = sorted((root / "apo" / seq_id).glob("*.cif")) if seq_id else []
         if apo_cifs:
             try:
-                # `rmsd_binder_apo_holo` rather than the superposition spelled
-                # out here: same calculation, and it additionally refuses a
-                # holo structure with no binder chain instead of returning a
-                # degenerate number.
-                from rfd3_pipeline.metrics.rmsd import rmsd_binder_apo_holo
+                # Diagnostic since 2026-10-09: recorded because a binder
+                # that changes shape on binding is worth seeing, but no longer
+                # gated -- "does it fold without the target" is the apo gate's
+                # question, asked earlier and more cheaply.
+                from rfd3_pipeline.metrics.rmsd import rmsd_binder_fold
 
                 apo = load_structure(apo_cifs[0])
-                metrics["holo_rmsd_apo_holo"] = rmsd_binder_apo_holo(
+                metrics["holo_rmsd_apo_holo"] = rmsd_binder_fold(
                     predicted, apo, binder
                 )
             except Exception as error:

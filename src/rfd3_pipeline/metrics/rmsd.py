@@ -6,11 +6,15 @@ Three metrics, differing only in what is aligned and what is measured:
   residues. Does the scaffolded motif sit where RFD3 placed it?
 * `rmsd_binder_on_target` -- align on the target chains, measure the whole
   binder. Recorded, not gated.
-* `rmsd_binder_apo_holo`  -- align binder-on-binder, measure the binder. Does
-  the binder fold the same free as bound?
+* `rmsd_binder_fold`      -- align binder-on-binder, measure the binder. Did
+  it fold into the same shape? Asked of four different pairs of structures:
+  apo and holo against the design, cross-validation against the design, and
+  cross-validation against holo. One name for one operation, because when the
+  only name on offer was `rmsd_binder_apo_holo` -- true of one of the four --
+  the other three were written out by hand at three separate call sites.
 
 The last one is deliberately *not* target-aligned. The original plan specified
-aligning it on the target chains, which cannot work: the apo prediction is
+aligning it on the target chains, which cannot work for apo: that prediction is
 binder-only and has no target chains. Binder-on-binder superposition is both the
 only computable form and the meaningful one.
 
@@ -34,7 +38,7 @@ __all__ = [
     "target_superposition",
     "rmsd_motif_on_target",
     "rmsd_binder_on_target",
-    "rmsd_binder_apo_holo",
+    "rmsd_binder_fold",
 ]
 
 
@@ -193,17 +197,3 @@ def rmsd_binder_fold(reference, predicted, binder_chain: str) -> float:
     return superimpose_rmsd(reference_ca, predicted_ca)
 
 
-def rmsd_binder_apo_holo(holo, apo, binder_chain: str) -> float:
-    """Binder-on-binder RMSD between the apo and holo predictions.
-
-    The apo/holo framing of `rmsd_binder_fold`, kept because that comparison
-    has a meaning the generic one does not: it asks whether binding changed the
-    binder's shape, which is what `threshold_rmsd_apo_holo` was written for.
-
-    It keeps its own guard rather than inheriting the generic one, so the error
-    names *holo* -- a caller who asked an apo/holo question should not be told
-    which argument was the "reference".
-    """
-    if chain_subset(holo, binder_chain).array_length() == 0:
-        raise ValueError(f"binder chain {binder_chain!r} absent from the holo structure")
-    return rmsd_binder_fold(holo, apo, binder_chain)

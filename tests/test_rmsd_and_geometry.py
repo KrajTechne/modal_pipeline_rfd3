@@ -7,7 +7,7 @@ from conftest import make_atoms, rotation_matrix
 from rfd3_pipeline.metrics import (
     expected_radius_of_gyration,
     rg_report,
-    rmsd_binder_apo_holo,
+    rmsd_binder_fold,
     rmsd_binder_on_target,
     rmsd_motif_on_target,
     target_superposition,
@@ -116,10 +116,18 @@ class TestMatchCa:
             match_ca(a, b)
 
 
-class TestApoHolo:
+class TestBinderFold:
+    """Binder-on-binder RMSD: fold, not placement.
+
+    Was `TestApoHolo`, against a `rmsd_binder_apo_holo` wrapper that has since
+    been removed. None of these tests was apo/holo-specific -- they pin the
+    semantics of the operation, which the pipeline asks of four different pairs
+    of structures, so they belong on the function named for the operation.
+    """
+
     def test_identical_binder_scores_zero(self, helix_holo):
         holo, binder = helix_holo
-        assert rmsd_binder_apo_holo(holo, binder, "A") == pytest.approx(0.0, abs=1e-6)
+        assert rmsd_binder_fold(holo, binder, "A") == pytest.approx(0.0, abs=1e-6)
 
     def test_rigid_motion_is_removed_by_superposition(self, helix_holo, helix_coords):
         holo, _ = helix_holo
@@ -127,20 +135,20 @@ class TestApoHolo:
         apo = make_atoms("A", range(1, 13), moved)
         # Tolerance is float32 coordinate noise, not slack: biotite stores coords
         # as float32, so a large rotation plus translation leaves ~1e-6 residue.
-        assert rmsd_binder_apo_holo(holo, apo, "A") == pytest.approx(0.0, abs=1e-5)
+        assert rmsd_binder_fold(holo, apo, "A") == pytest.approx(0.0, abs=1e-5)
 
     def test_conformational_change_is_detected(self, helix_holo, helix_coords):
         holo, _ = helix_holo
         bent = helix_coords.copy()
         bent[6:, 0] += 6.0
         apo = make_atoms("A", range(1, 13), bent)
-        assert rmsd_binder_apo_holo(holo, apo, "A") > 1.0
+        assert rmsd_binder_fold(holo, apo, "A") > 1.0
 
-    def test_raises_when_binder_absent_from_holo(self, helix_coords):
+    def test_raises_when_the_binder_chain_is_absent(self, helix_coords):
         holo = make_atoms("B", range(1, 13), helix_coords)
         apo = make_atoms("A", range(1, 13), helix_coords)
-        with pytest.raises(ValueError, match="absent from the holo"):
-            rmsd_binder_apo_holo(holo, apo, "A")
+        with pytest.raises(ValueError, match="absent from the reference"):
+            rmsd_binder_fold(holo, apo, "A")
 
 
 class TestTargetAligned:
@@ -193,36 +201,3 @@ class TestTargetAligned:
         designed, predicted = self._pair(0.0)
         with pytest.raises(ValueError, match="absent from the shared residue set"):
             target_superposition(designed, predicted, "A", ["Z"])
-
-
-class TestBinderFoldIsTheGenericForm:
-    """`rmsd_binder_fold` names the operation; `rmsd_binder_apo_holo` names one
-    pair of inputs. Because only the latter existed, the same two-line idiom
-    was written out at three separate call sites in `app.py` -- none of which
-    carried its guard."""
-
-    def test_the_apo_holo_form_delegates_to_it(self, helix_holo):
-        from rfd3_pipeline.metrics.rmsd import (
-            rmsd_binder_apo_holo,
-            rmsd_binder_fold,
-        )
-
-        holo, apo = helix_holo
-        assert rmsd_binder_apo_holo(holo, apo, "A") == pytest.approx(
-            rmsd_binder_fold(holo, apo, "A")
-        )
-
-    def test_it_guards_a_missing_binder_in_its_own_terms(self, helix_holo):
-        """The generic form says "reference"; the apo/holo form says "holo", so
-        a caller is told about the argument they actually passed."""
-        from rfd3_pipeline.metrics.rmsd import rmsd_binder_fold
-
-        holo, apo = helix_holo
-        with pytest.raises(ValueError, match="absent from the reference"):
-            rmsd_binder_fold(holo, apo, "Z")
-
-    def test_identical_structures_score_zero(self, helix_holo):
-        from rfd3_pipeline.metrics.rmsd import rmsd_binder_fold
-
-        holo, _ = helix_holo
-        assert rmsd_binder_fold(holo, holo, "A") == pytest.approx(0.0, abs=1e-6)
