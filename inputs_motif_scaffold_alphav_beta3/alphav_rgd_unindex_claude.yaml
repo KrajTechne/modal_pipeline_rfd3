@@ -12,7 +12,10 @@ general:
   chain_binder: A
   chain_targets: [B, C]          # list, not a comma string
   name_design_campaign: motif_scaffold_alphav_beta3
-  run_name: alphav_beta3_01
+  # 02: the first full campaign. 01 holds only a stale summary pair from a
+  # `reduce_only` run against the wrong directory, and RFD3 skips designs
+  # already present -- so a fresh name keeps this run unambiguously one run.
+  run_name: alphav_beta3_02
   base_seed: 0                   # cross-validation seeds derive from this
 
   # Keyed by chain so each can be asserted against the input structure at load.

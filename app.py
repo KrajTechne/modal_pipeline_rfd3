@@ -2367,7 +2367,12 @@ def orchestrate(campaign_payload: dict, start_at: str = "rfd3", chunk_size: int 
         # argument: decorators run at import, before any campaign is read.
         # `with_options` is the runtime equivalent.
         rfd3_results = list(
-            run_rfd3.with_options(max_containers=rfd3.max_concurrent).map(
+            # `gpu=` as well as `max_containers=`: without it the
+            # decorator's default wins and `rfdiffusion3.gpu` is silently
+            # ignored, which reads as working only because the two agree.
+            run_rfd3.with_options(
+                gpu=rfd3.gpu, max_containers=rfd3.max_concurrent
+            ).map(
                 spec_names, kwargs={"campaign_payload": campaign_payload}
             )
         )
@@ -2415,7 +2420,10 @@ def orchestrate(campaign_payload: dict, start_at: str = "rfd3", chunk_size: int 
         )
         if chunks:
             report["mpnn"] = list(
-                run_mpnn.with_options(max_containers=campaign.mpnn.max_concurrent).map(
+                run_mpnn.with_options(
+                    gpu=campaign.mpnn.gpu,
+                    max_containers=campaign.mpnn.max_concurrent,
+                ).map(
                     chunks, kwargs={"campaign_payload": campaign_payload}
                 )
             )

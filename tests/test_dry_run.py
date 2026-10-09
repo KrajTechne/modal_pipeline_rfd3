@@ -90,8 +90,10 @@ class TestScaleReduction:
 
 class TestItCannotBeMistakenForARealRun:
     def test_run_name_is_renamed_so_output_lands_elsewhere(self, raw, dry):
-        assert raw["general"]["run_name"] == "alphav_beta3_01"
-        assert dry.general.run_name == "alphav_beta3_01" + DRY_RUN_SUFFIX
+        """Derived from the campaign, not hardcoded: the point is the suffix,
+        and pinning the literal name broke this test the first time the run was
+        renamed for a fresh output directory."""
+        assert dry.general.run_name == raw["general"]["run_name"] + DRY_RUN_SUFFIX
 
     def test_renaming_is_idempotent(self, raw):
         once = apply_dry_run(raw)
@@ -104,10 +106,11 @@ class TestItCannotBeMistakenForARealRun:
     def test_a_normal_campaign_is_not_flagged(self, raw):
         assert CampaignConfig.model_validate(raw).run.dry_run is False
 
-    def test_banner_names_what_changed(self, dry):
+    def test_banner_names_what_changed(self, raw, dry):
         banner = dry_run_banner(dry)
         assert "DRY RUN" in banner
-        assert "alphav_beta3_01-dryrun" in banner
+        # The suffixed name, whatever the campaign calls the run.
+        assert raw["general"]["run_name"] + DRY_RUN_SUFFIX in banner
         assert "designs  : 3" in banner
         assert "--dry-run" in banner
 
