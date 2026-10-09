@@ -1165,22 +1165,78 @@ Apo gets neither: it folds the binder alone, so there is nothing to align
 against. That is a property of the stage, not an omission.
 
 The first numbers are uncomfortable, and are the reason this distinction is
-worth writing down:
+worth writing down. All four sequences of the 2026-10-09 dry run, with the old
+gate's verdict in the last column:
 
-| seq_id | stage | fold | placement | motif | ipSAE |
-|---|---|---|---|---|---|
-| model_1_seq1 | holo | 0.77 | 3.77 | 0.83 | 0.598 |
-| model_1_seq1 | cv | 1.85 | 7.78 | 9.65 | 0.000 |
-| model_1_seq2 | holo | 1.11 | **20.98** | 7.24 | 0.012 |
-| model_2_seq2 | holo | 3.52 | 4.90 | **0.76** | 0.540 |
+| seq_id | stage | fold | placement | motif | ipTM | ipSAE | old gate |
+|---|---|---|---|---|---|---|---|
+| model_1_seq1 | apo | 0.72 | -- | -- | -- | -- | pass |
+| model_1_seq1 | holo | 0.77 | 3.77 | 0.83 | 0.908 | 0.598 | **pass** |
+| model_1_seq1 | cv | 1.85 | 7.78 | 9.65 | 0.690 | 0.000 | -- |
+| model_1_seq2 | apo | 1.12 | -- | -- | -- | -- | pass |
+| model_1_seq2 | holo | 1.11 | **20.98** | 7.24 | 0.797 | 0.012 | **pass** |
+| model_1_seq2 | cv | 1.06 | 19.82 | 21.48 | 0.610 | 0.000 | -- |
+| model_2_seq1 | apo | 8.37 | -- | -- | -- | -- | pass |
+| model_2_seq1 | holo | 3.97 | 15.59 | **0.48** | 0.735 | 0.024 | fail |
+| model_2_seq2 | apo | 6.53 | -- | -- | -- | -- | pass |
+| model_2_seq2 | holo | 3.52 | 4.90 | **0.76** | 0.888 | 0.540 | fail |
 
-`model_1_seq2` **passed** the holo gate with its binder 21 A from where it was
-designed, because the gate tests fold change and ipTM and it reads healthy by
-both. `model_2_seq2` was **rejected** while placing the motif to 0.76 A with
-ipSAE 0.54. Four sequences at dry-run scale is a signal rather than a
-conclusion, but it says the gate may be poorly aligned with the design
-objective, and nothing could see it until these columns existed. Settle it
-before a full campaign.
+Cross-validation also reports `cv_rmsd_placement_vs_holo`: 5.26 for seq1 and
+11.84 for seq2. `apo_iptm` reads 0.000 because apo folds one chain -- expected,
+not a fault.
+
+Four things follow, and the ipTM column is what makes the first one visible.
+
+**ipTM at 0.3 was doing no work.** Every holo value is 0.735-0.908, so the
+entire discriminating power of the old gate sat in `rmsd_apo_holo`.
+
+**ipTM and ipSAE disagree on the same structure.** `model_1_seq2` has the
+second-highest ipTM (0.797) and the lowest ipSAE (0.012), with its binder 21 A
+out of place. ipSAE tracked placement here and ipTM did not.
+
+**The old gate was anti-correlated with the design objective.** It passed
+`model_1_seq2` (binder 21 A out, motif 7.24, ipSAE 0.012) and rejected
+`model_2_seq2` (motif 0.76, ipSAE 0.540).
+
+**No single column suffices**, which `model_2_seq1` shows: the motif is placed
+best of all four (0.48 A) while the whole binder sits 15.6 A out and ipSAE is
+0.024. The three motif residues anchored and the scaffold swung away. Motif
+RMSD alone would have called it a success.
+
+Four sequences from two backbones do not calibrate thresholds. They were enough
+to change which *metrics* the gate reads, which is a different decision.
+
+### The gate as it stands [revised 2026-10-09]
+
+```
+apo    plddt_binder            >= 70     (and fold is watched, not gated)
+holo   iptm                    >= 0.7
+       rmsd_binder_on_target   <= 5.0
+       rmsd_motif_on_target    <= 2.0    (only when a spec sets `unindex`)
+cv     no gate -- fold, placement, motif, ipTM and ipSAE inform ranking
+```
+
+**Apo keeps confidence and only confidence.** It folds the binder alone, so
+there is no interface to score and no second structure to place it against.
+`apo_rmsd_to_design` is recorded and **watched rather than gated** -- not an
+oversight wanting a threshold, and not dead code wanting removal.
+
+**Holo moved to placement.** `rmsd_binder_on_target` is fitted on the target
+chains, so a binder that folds correctly and docks elsewhere no longer passes.
+ipTM rose to 0.7 for the reason above.
+
+**The motif gate is derived, not guessed.** A spec that sets `unindex` is
+scaffolding a motif; per design the same question is `n_motif_residues > 0`, so
+a campaign that scaffolds a motif while one design records none does not fail
+that design for a metric it never had.
+
+**`rmsd_apo_holo` is now diagnostic.** Still computed, still has a threshold in
+the config, no longer consulted. Its question -- does the binder fold without
+the target -- is the apo gate's, asked earlier and more cheaply.
+
+Applied to the table above, the new gate passes `model_1_seq1` and
+`model_2_seq2`: exactly the two with the highest ipSAE. That is weak evidence
+from four points, not validation, but it is the right direction.
 
 ### The holo gate
 

@@ -627,9 +627,62 @@ class _FoldingBase(_Base):
 
 class RefoldingConfig(_FoldingBase):
     threshold_plddt_binder: float = 70.0
+    """The apo gate, and the whole of it. 70 is the user's prior practice -- a
+    binder should fold on its own, not only when the target holds it.
+
+    Apo also records `apo_rmsd_to_design`, which is **watched and deliberately
+    not gated** [decided 2026-10-09]. Two notes for whoever reads it next: it
+    is not an oversight, so it does not want a threshold inventing; and it is
+    not dead, so the column should not be removed as unused. Apo has no
+    interface to score and no second structure to place the binder against, so
+    confidence is what it can gate on and reproducing the backbone is what it
+    can report."""
+
     threshold_rmsd_apo_holo: float = 4.0
+    """**Diagnostic only since 2026-10-09; the holo gate no longer applies
+    it.** Still computed as `holo_rmsd_apo_holo`, because a binder that changes
+    conformation on binding is worth seeing.
+
+    Dropped from the gate because it measures the wrong thing for this
+    pipeline's purpose and `threshold_plddt_binder` already covers most of what
+    it was there for. It superimposes the binder on the binder, so it reports
+    fold change and is blind to placement -- and it passed a design whose
+    binder sat 21 A from where it was designed while rejecting one that placed
+    the motif to 0.76 A. "Does it fold without the target" is the apo gate's
+    question, asked earlier and more cheaply."""
+
+    threshold_rmsd_binder_on_target: float = 5.0
+    """The holo gate's placement test: fit on the targets, measure the binder.
+
+    This is the column the gate was missing. Unlike every RMSD that preceded
+    it, the superposition is fitted on the target chains, so the binder's
+    displacement stays in the measurement instead of being fitted away.
+
+    5.0 A is a starting value, not a calibrated one. On the only four sequences
+    measured it separates them exactly as ipSAE does -- 3.77 and 4.90 passing
+    against 15.59 and 20.98 -- which is suggestive and not evidence. Revisit
+    once a real campaign has produced a distribution."""
+
     threshold_rmsd_motif: float = 2.0
-    threshold_ipTM: float = 0.3
+    """The holo gate's motif test, applied **only when the campaign scaffolds a
+    motif** -- that is, when a spec sets `unindex`. For such a campaign this is
+    the design objective rather than a diagnostic: the scaffold is allowed to
+    move, the motif is not.
+
+    Declared and unused until 2026-10-09, when `rmsd_motif_on_target` was
+    wired. The value is the campaign's own and was not re-chosen: measured
+    motif RMSDs are 0.48, 0.76 and 0.83 against one at 7.24, so 2.0 separates
+    them with room to spare -- though four sequences do not calibrate a
+    threshold."""
+    threshold_ipTM: float = 0.7
+    """Raised from 0.3 on 2026-10-09, because at 0.3 it was doing no work.
+    Across the four sequences measured, holo ipTM ran 0.735 to 0.908 -- every
+    one of them clearing 0.3 by a wide margin, so the entire discriminating
+    power of the gate sat in a single other term. 0.7 at least bites.
+
+    It is still the weaker of the gate's interface signals. ipTM disagreed
+    sharply with ipSAE on the same structures: one design scored 0.797 ipTM
+    with 0.012 ipSAE and its binder 21 A out of place."""
 
 
 class CrossValidationConfig(_FoldingBase):

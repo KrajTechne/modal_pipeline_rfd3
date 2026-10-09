@@ -119,10 +119,23 @@ refolding:
   chunk_size: 24                 # sequences per container; amortizes model load
   target_template: false         # esmfold2 cannot template; true is rejected
 
+  # The apo gate, and all of it. Apo folds the binder alone, so confidence is
+  # what it can judge. `apo_rmsd_to_design` is recorded and watched, not gated.
   threshold_plddt_binder: 70
-  threshold_rmsd_apo_holo: 4.0
+
+  # The holo gate [revised 2026-10-09]: placement, interface confidence, and
+  # the motif when a spec scaffolds one. Fitted on the targets, so a binder
+  # that folds correctly and docks elsewhere no longer passes.
+  threshold_rmsd_binder_on_target: 5.0
   threshold_rmsd_motif: 2.0
-  threshold_ipTM: 0.3
+  # Raised from 0.3, which was doing no work: every sequence measured scored
+  # 0.735-0.908, so one other term carried the whole gate.
+  threshold_ipTM: 0.7
+
+  # Diagnostic only -- no longer gated. It measures fold change and is blind to
+  # placement, and it passed a design whose binder sat 21 A from its design
+  # while rejecting one that placed the motif to 0.76 A.
+  threshold_rmsd_apo_holo: 4.0
 
 cross_validation:                # was `cross-validation`; hyphen is awkward in Python
   # The sokrypton/alphafold3 fork driven directly, not the af3_jax kit. The kit

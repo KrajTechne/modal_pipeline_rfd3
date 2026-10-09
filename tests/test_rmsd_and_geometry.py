@@ -193,3 +193,36 @@ class TestTargetAligned:
         designed, predicted = self._pair(0.0)
         with pytest.raises(ValueError, match="absent from the shared residue set"):
             target_superposition(designed, predicted, "A", ["Z"])
+
+
+class TestBinderFoldIsTheGenericForm:
+    """`rmsd_binder_fold` names the operation; `rmsd_binder_apo_holo` names one
+    pair of inputs. Because only the latter existed, the same two-line idiom
+    was written out at three separate call sites in `app.py` -- none of which
+    carried its guard."""
+
+    def test_the_apo_holo_form_delegates_to_it(self, helix_holo):
+        from rfd3_pipeline.metrics.rmsd import (
+            rmsd_binder_apo_holo,
+            rmsd_binder_fold,
+        )
+
+        holo, apo = helix_holo
+        assert rmsd_binder_apo_holo(holo, apo, "A") == pytest.approx(
+            rmsd_binder_fold(holo, apo, "A")
+        )
+
+    def test_it_guards_a_missing_binder_in_its_own_terms(self, helix_holo):
+        """The generic form says "reference"; the apo/holo form says "holo", so
+        a caller is told about the argument they actually passed."""
+        from rfd3_pipeline.metrics.rmsd import rmsd_binder_fold
+
+        holo, apo = helix_holo
+        with pytest.raises(ValueError, match="absent from the reference"):
+            rmsd_binder_fold(holo, apo, "Z")
+
+    def test_identical_structures_score_zero(self, helix_holo):
+        from rfd3_pipeline.metrics.rmsd import rmsd_binder_fold
+
+        holo, _ = helix_holo
+        assert rmsd_binder_fold(holo, holo, "A") == pytest.approx(0.0, abs=1e-6)

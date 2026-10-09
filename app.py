@@ -1437,7 +1437,7 @@ def _refold_metrics(
         metrics[f"{prefix}error"] = "no cif produced"
         return metrics
 
-    from rfd3_pipeline.structure import chain_subset, ca_only, load_structure, match_ca
+    from rfd3_pipeline.structure import ca_only, chain_subset, load_structure
 
     # `b_factor` is where the kit writes pLDDT, and biotite does not read it
     # unless asked -- without this the attribute is absent entirely.
@@ -1459,11 +1459,11 @@ def _refold_metrics(
     design_path = root / "rfd3" / "out" / f"{design_id}.cif.gz" if design_id else None
     if design_path is not None and design_path.is_file():
         try:
-            from rfd3_pipeline.metrics.rmsd import superimpose_rmsd
+            from rfd3_pipeline.metrics.rmsd import rmsd_binder_fold
 
-            design = load_structure(design_path)
-            design_ca, predicted_ca, _ = match_ca(design, predicted, chains=[binder])
-            metrics[f"{prefix}rmsd_to_design"] = superimpose_rmsd(design_ca, predicted_ca)
+            metrics[f"{prefix}rmsd_to_design"] = rmsd_binder_fold(
+                load_structure(design_path), predicted, binder
+            )
         except Exception as error:
             metrics[f"{prefix}rmsd_to_design"] = None
             metrics[f"{prefix}rmsd_error"] = f"{type(error).__name__}: {error}"
@@ -1811,7 +1811,7 @@ def _cv_structure_metrics(
     a null that means "biotite raised" and a null that means "no holo
     structure" need telling apart.
     """
-    from rfd3_pipeline.structure import ca_only, chain_subset, load_structure, match_ca
+    from rfd3_pipeline.structure import ca_only, chain_subset, load_structure
 
     metrics: dict[str, object] = {}
     if campaign is not None:
@@ -1835,11 +1835,10 @@ def _cv_structure_metrics(
     design = root / "rfd3" / "out" / f"{design_id}.cif.gz" if design_id else None
     if design is not None and design.is_file():
         try:
-            from rfd3_pipeline.metrics.rmsd import superimpose_rmsd
+            from rfd3_pipeline.metrics.rmsd import rmsd_binder_fold
 
             designed = load_structure(design)
-            design_ca, cv_ca, _ = match_ca(designed, predicted, chains=[binder])
-            metrics["cv_rmsd_to_design"] = superimpose_rmsd(design_ca, cv_ca)
+            metrics["cv_rmsd_to_design"] = rmsd_binder_fold(designed, predicted, binder)
             if campaign is not None:
                 metrics.update(
                     _target_aligned_rmsds(
@@ -1862,11 +1861,10 @@ def _cv_structure_metrics(
         metrics["cv_rmsd_to_holo"] = None
         return metrics
     try:
-        from rfd3_pipeline.metrics.rmsd import superimpose_rmsd
+        from rfd3_pipeline.metrics.rmsd import rmsd_binder_fold
 
         holo = load_structure(holo_cifs[0])
-        holo_ca, cv_ca, _ = match_ca(holo, predicted, chains=[binder])
-        metrics["cv_rmsd_to_holo"] = superimpose_rmsd(holo_ca, cv_ca)
+        metrics["cv_rmsd_to_holo"] = rmsd_binder_fold(holo, predicted, binder)
         # Whether the two models dock the binder in the same place, as opposed
         # to folding it the same way. The holo structure carries the targets,
         # so this is the one comparison that can distinguish them.
@@ -2277,7 +2275,13 @@ def reduce_summaries(campaign_payload: dict) -> dict:
         stage_gates={
             Stage.BACKBONE_FILTERS: backbone_gates(campaign.rfdiffusion3),
             Stage.APO: refold_gates(campaign.refolding, Stage.APO),
-            Stage.HOLO: refold_gates(campaign.refolding, Stage.HOLO),
+            # Campaign-level here, where the per-design record is not in view:
+            # a spec that sets `unindex` is scaffolding a motif.
+            Stage.HOLO: refold_gates(
+                campaign.refolding,
+                Stage.HOLO,
+                has_motif=any(spec.unindex for spec in rfd3.specs),
+            ),
         },
         dry_run=campaign.run.dry_run,
         # What the campaign asked for. The records cannot say whether three

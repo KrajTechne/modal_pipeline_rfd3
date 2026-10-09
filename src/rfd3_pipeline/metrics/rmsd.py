@@ -161,16 +161,49 @@ def rmsd_binder_on_target(
     return fit.rmsd_over(None)
 
 
+def rmsd_binder_fold(reference, predicted, binder_chain: str) -> float:
+    """Binder-on-binder RMSD between any two structures holding that chain.
+
+    **Fold, not placement.** The binder is pulled out of both structures and
+    superimposed on itself, so translation and rotation are fitted away and the
+    targets never enter the calculation. It answers "did it fold into the same
+    shape", and a binder that folds identically while docking somewhere else
+    scores near zero. `rmsd_binder_on_target` is the question about placement.
+
+    Named for the operation rather than for one pair of inputs, which is the
+    point: the pipeline asks this of apo against the design, holo against the
+    design, cross-validation against the design, and cross-validation against
+    holo. All four are this function. It previously existed only as
+    `rmsd_binder_apo_holo`, and because that name described one of the four,
+    the other three were written out by hand at three separate call sites --
+    none of which carried the guard below.
+
+    Residues are paired on (chain, res_id), so a model that drops or renumbers
+    them raises rather than silently mis-pairing.
+    """
+    reference_binder = chain_subset(reference, binder_chain)
+    if reference_binder.array_length() == 0:
+        raise ValueError(
+            f"binder chain {binder_chain!r} absent from the reference structure"
+        )
+
+    reference_ca, predicted_ca, _ = match_ca(
+        reference_binder, predicted, chains=[binder_chain]
+    )
+    return superimpose_rmsd(reference_ca, predicted_ca)
+
+
 def rmsd_binder_apo_holo(holo, apo, binder_chain: str) -> float:
     """Binder-on-binder RMSD between the apo and holo predictions.
 
-    The binder chain is pulled out of the holo complex and the apo structure is
-    superimposed onto it. Residues are paired on (chain, res_id), so a model
-    that drops or renumbers residues raises rather than silently mis-pairing.
-    """
-    holo_binder = chain_subset(holo, binder_chain)
-    if holo_binder.array_length() == 0:
-        raise ValueError(f"binder chain {binder_chain!r} absent from the holo structure")
+    The apo/holo framing of `rmsd_binder_fold`, kept because that comparison
+    has a meaning the generic one does not: it asks whether binding changed the
+    binder's shape, which is what `threshold_rmsd_apo_holo` was written for.
 
-    holo_ca, apo_ca, _ = match_ca(holo_binder, apo, chains=[binder_chain])
-    return superimpose_rmsd(holo_ca, apo_ca)
+    It keeps its own guard rather than inheriting the generic one, so the error
+    names *holo* -- a caller who asked an apo/holo question should not be told
+    which argument was the "reference".
+    """
+    if chain_subset(holo, binder_chain).array_length() == 0:
+        raise ValueError(f"binder chain {binder_chain!r} absent from the holo structure")
+    return rmsd_binder_fold(holo, apo, binder_chain)

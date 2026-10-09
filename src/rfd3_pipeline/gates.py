@@ -149,7 +149,9 @@ def backbone_gates(rfd3_config) -> tuple[Gate, ...]:
     )
 
 
-def refold_gates(refolding_config, stage: str) -> tuple[Gate, ...]:
+def refold_gates(
+    refolding_config, stage: str, *, has_motif: bool = False
+) -> tuple[Gate, ...]:
     """The gates for one refolding stage, read from the `refolding` block.
 
     Declared here rather than applied by hand in `app.py` for the reason this
@@ -159,21 +161,50 @@ def refold_gates(refolding_config, stage: str) -> tuple[Gate, ...]:
     `holo_pass_iptm` instead of the `{metric}_pass` form the funnel counts, so
     the per-metric failure counts silently stayed zero.
 
-    Apo gates on one metric and holo on two, which is a fact about what each
-    stage can measure, not a preference: apo folds the binder alone, so there
-    is no interface to score and no second structure to compare against.
+    **Apo asks whether the binder folds; holo asks where it went.** That split
+    is a fact about what each stage can measure rather than a preference. Apo
+    folds the binder alone, so there is no interface to score and no second
+    structure to place it against -- `plddt_binder` is all it has. Holo has the
+    complex, so it tests the interface (`iptm`) and the placement
+    (`rmsd_binder_on_target`, fitted on the targets so displacement is not
+    fitted away).
+
+    `has_motif` adds the motif gate, and the caller decides it from the
+    campaign rather than this module guessing: a spec that sets `unindex` is
+    scaffolding a motif, and for such a campaign the motif's placement *is* the
+    objective while the scaffold is free to move. Per-design the same question
+    is `n_motif_residues > 0`.
+
+    Deliberately **not** gated here any more: `rmsd_apo_holo`. See
+    `RefoldingConfig.threshold_rmsd_apo_holo` for why -- it measures fold
+    change, is blind to placement, and passed a design sitting 21 A from where
+    it was designed.
     """
     if stage == Stage.APO:
         return (
             Gate("plddt_binder", ">=", refolding_config.threshold_plddt_binder),
         )
     if stage == Stage.HOLO:
-        return (
+        gates = [
             Gate("iptm", ">=", refolding_config.threshold_ipTM),
-            Gate("rmsd_apo_holo", "<=", refolding_config.threshold_rmsd_apo_holo),
-        )
+            Gate(
+                "rmsd_binder_on_target",
+                "<=",
+                refolding_config.threshold_rmsd_binder_on_target,
+            ),
+        ]
+        if has_motif:
+            gates.append(
+                Gate(
+                    "rmsd_motif_on_target",
+                    "<=",
+                    refolding_config.threshold_rmsd_motif,
+                )
+            )
+        return tuple(gates)
     # CV has no gates: nothing runs after it, so there is nothing to gate for.
-    # Its numbers inform ranking instead.
+    # Its numbers -- fold, placement, motif, ipTM and ipSAE -- inform ranking
+    # instead, which is why all five are computed and none is thresholded.
     return ()
 
 
@@ -206,11 +237,17 @@ def refold_verdict(
     `holo_fail_reasons` would leave those two columns null on a holo failure,
     so the one place a reader looks would say nothing.
     """
-    gates = refold_gates(refolding_config, stage)
+    # The motif gate is decided per design, not per campaign: a campaign can
+    # scaffold a motif while an individual design records none, and gating on a
+    # metric that was never computed would fail it for the wrong reason.
+    prefix = f"{stage}_"
+    gates = refold_gates(
+        refolding_config,
+        stage,
+        has_motif=bool(metrics.get(f"{prefix}n_motif_residues")),
+    )
     if not gates:
         return {}
-
-    prefix = f"{stage}_"
     values = {gate.metric: metrics.get(f"{prefix}{gate.metric}") for gate in gates}
     unmeasured = sorted(metric for metric, value in values.items() if value is None)
     if unmeasured:
