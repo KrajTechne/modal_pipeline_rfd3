@@ -75,14 +75,16 @@ app = modal.App("af3-jax-image-probe")
 
 weights = modal.Volume.from_name("rfd3-weights", create_if_missing=True)
 jit = modal.Volume.from_name("rfd3-jit", create_if_missing=True)
+data = modal.Volume.from_name("rfd3-pipeline", create_if_missing=True)
 
 WEIGHTS = "/weights"
 JIT = "/jit"
+DATA = "/data"
 AF3_WEIGHTS = f"{WEIGHTS}/af3"
 AF3_JIT = f"{JIT}/af3_jax"
 KIT = "/kit/af3_jax"
 CARD = "a100"
-VOLUMES = {WEIGHTS: weights, JIT: jit}
+VOLUMES = {WEIGHTS: weights, JIT: jit, DATA: data}
 
 CONTEXT = Path.home() / "ubm_af3"
 
@@ -110,6 +112,9 @@ af3_image = (
         }
     )
 )
+
+# A newline, named so the MSA strings below need no escape.
+NL = chr(10)
 
 TIMEOUT = 3 * 60 * 60
 GPU = "A100-40GB"
@@ -263,10 +268,237 @@ def warm() -> dict:
     return report
 
 
+@app.function(image=af3_image, gpu=GPU, volumes=VOLUMES, timeout=TIMEOUT)
+def run_one(
+    run_root: str = "motif_scaffold_alphav_beta3/alphav_beta3_01-dryrun",
+    campaign: str = "motif_scaffold_alphav_beta3",
+    n_seeds: int = 2,
+    mode: str = "exact",
+) -> dict:
+    """One cross-validation-shaped prediction, from the pipeline's own shards.
+
+    Assembled as the fork's schema requires rather than as ESMFold2's does:
+    a *directory* of JSONs, entities wrapped by type, MSAs inline in camelCase,
+    and the seeds in the input rather than on the command line.
+
+    `pairedMsa` is `""` throughout. Empty string counts as *set*, so
+    `fill_missing_msas` skips the chain and nothing reaches the network -- the
+    kit's own example ships the same way. Pairing is the piece the MSA cache
+    deliberately does not build, so this run measures OpenFold3 without it.
+    """
+    import json
+    import time
+
+    data.reload()
+    root = Path(DATA) / run_root
+    shards = root / "shards"
+    cache_dir = Path(DATA) / campaign / "msa_cache"
+
+    records = [json.loads(p.read_text()) for p in sorted(shards.glob("*.json"))]
+    # Holo survivors: cross-validation exists to second-guess holo, so it has
+    # no business running on sequences holo never folded.
+    candidates = [
+        r for r in records
+        if r.get("seq_id") and r.get("sequence") and r.get("holo_status") == "ok"
+    ]
+    report: dict[str, object] = {
+        "shards": len(records),
+        "holo_ok_sequences": len(candidates),
+        "msa_cache_files": sorted(p.name for p in cache_dir.glob("*.a3m")),
+    }
+    if not candidates:
+        report["error"] = f"no holo-folded sequences under {shards}"
+        return report
+
+    record = candidates[0]
+    seq_id = record["seq_id"]
+    report["seq_id"] = seq_id
+
+    # Targets carry their cached unpaired alignment; the binder carries only
+    # itself, because a de novo binder has no homologs to find.
+    cached = sorted(cache_dir.glob("*.a3m"))
+    entities = [
+        {
+            "protein": {
+                "id": "A",
+                "sequence": record["sequence"],
+                "unpairedMsa": ">query" + NL + record["sequence"] + NL,
+                "pairedMsa": "",
+                "templates": [],
+            }
+        }
+    ]
+    for chain, a3m in zip(("B", "C"), cached):
+        text = a3m.read_text()
+        # The query sequence of a ColabFold a3m is its first record.
+        lines = [ln for ln in text.splitlines() if ln and not ln.startswith(">")]
+        entities.append(
+            {
+                "protein": {
+                    "id": chain,
+                    "sequence": lines[0],
+                    "unpairedMsa": text,
+                    "pairedMsa": "",
+                    "templates": [],
+                }
+            }
+        )
+    # AF3 treats ions as ligands (`docs/input.md:93-96`).
+    entities.append({"ligand": {"id": "E", "ccdCodes": ["MN"]}})
+
+    work = Path("/tmp/cv")
+    (work / "in").mkdir(parents=True, exist_ok=True)
+    payload = {
+        "dialect": "alphafold3",
+        "version": 2,
+        "name": seq_id,
+        # Explicit, not `--num_seeds`: the fork uses the input's seeds when the
+        # flag is absent, so these stay ours and the run is repeatable.
+        "modelSeeds": list(range(n_seeds)),
+        "sequences": entities,
+    }
+    (work / "in" / f"{seq_id}.json").write_text(json.dumps(payload, indent=2))
+    report["chains"] = [list(e)[0] + ":" + e[list(e)[0]]["id"] for e in entities]
+    report["model_seeds"] = payload["modelSeeds"]
+
+    out_dir = work / "out"
+    started = time.monotonic()
+    code, tail = _stream(
+        ["bash", "run.sh", "pred", "--config", CARD, "--variant", "p2",
+         "--mode", mode, "--input_dir", str(work / "in"),
+         "--output_dir", str(out_dir),
+         # Without this a re-run appends a timestamp to the job directory
+         # (`docs/output.md`), so the output path stops being addressable by
+         # seq_id.
+         "--force_output_dir"]
+    )
+    report["seconds"] = round(time.monotonic() - started, 1)
+    report["returncode"] = code
+    report["output_tail"] = tail
+
+    # Reported whatever the exit code. The first attempt returned 5 with
+    # `predictions=10/10` -- the kit refusing to certify the mode, not a failed
+    # fold -- and returning early here discarded the outputs that did exist.
+    produced = sorted(
+        str(p.relative_to(out_dir)) for p in out_dir.rglob("*") if p.is_file()
+    ) if out_dir.is_dir() else []
+    report["produced"] = produced[:40]
+    report["n_files"] = len(produced)
+    ranking = next((p for p in out_dir.rglob("ranking_scores.csv")), None)
+    if ranking is not None:
+        report["ranking_scores_csv"] = ranking.read_text()[:600]
+    summary = next((p for p in out_dir.rglob("*_summary_confidences.json")), None)
+    if summary is not None:
+        import json as _json
+
+        report["summary_confidences_keys"] = sorted(_json.loads(summary.read_text()))
+        report["summary_confidences"] = summary.read_text()[:700]
+    return report
+
+
+@app.function(image=af3_image, gpu=GPU, volumes=VOLUMES, timeout=TIMEOUT)
+def scripts() -> dict:
+    """Which run_alphafold scripts the image actually holds.
+
+    The kit's own command line ran
+    `/alphafold3_venv/bin/python .../fpf_launch.py .../run_alphafold_flashpairformer.py
+    /app/alphafold/run_alphafold_fast.py`, so the fork is already installed --
+    calling it directly needs no new image, only the right script and
+    interpreter. Worth listing rather than guessing, since the kit ships a
+    patched copy alongside the stock one.
+    """
+    import subprocess
+
+    found = {}
+    for root in ("/app", "/kit", "/alphafold3_venv"):
+        base = Path(root)
+        if not base.is_dir():
+            continue
+        found[root] = sorted(
+            str(p) for p in base.rglob("run_alphafold*.py") if p.is_file()
+        )[:12]
+
+    report: dict[str, object] = {"scripts": found}
+    stock = Path("/app/alphafold/run_alphafold.py")
+    report["stock_present"] = stock.is_file()
+    if stock.is_file():
+        helped = subprocess.run(
+            ["/alphafold3_venv/bin/python", str(stock), "--help"],
+            capture_output=True, text=True,
+        )
+        text = (helped.stdout or "") + (helped.stderr or "")
+        report["stock_help_returncode"] = helped.returncode
+        report["stock_flags"] = sorted(
+            set(
+                line.strip().split()[0]
+                for line in text.splitlines()
+                if line.strip().startswith("--")
+            )
+        )[:40]
+    return report
+
+
+@app.function(image=af3_image, volumes=VOLUMES, timeout=30 * 60)
+def versions() -> dict:
+    """Pin down the tokamax failure: whose incompatibility is it?
+
+    `rc=5 kernels_refused` on every mode traces to
+    `AttributeError: 'jaxlib...NameLoc' object has no attribute 'is_a_name'`,
+    raised when tokamax autotunes. jax and jaxlib are both pinned to 0.10.2 in
+    the kit's `requirements.lock`, so it is not a jax/jaxlib mismatch; the
+    question is whether tokamax 0.0.12 and that jaxlib can coexist at all.
+    """
+    import subprocess
+
+    # Built as a joined list: escape sequences in a heredoc have bitten this
+    # file once already, and a list of plain lines cannot be mangled.
+    probe_lines = [
+        "import importlib.metadata as md",
+        "for name in ('jax', 'jaxlib', 'tokamax', 'jax-cuda12-plugin'):",
+        "    try: print(name, md.version(name))",
+        "    except Exception as e: print(name, 'ABSENT', type(e).__name__)",
+        "from jaxlib.mlir import ir",
+        "attrs = [a for a in dir(ir.NameLoc) if 'is_a' in a]",
+        "print('is_a attrs on NameLoc:', attrs or 'NONE')",
+        "print('has is_a_name:', hasattr(ir.NameLoc, 'is_a_name'))",
+    ]
+    script = chr(10).join(probe_lines)
+    probe = subprocess.run(
+        ["/alphafold3_venv/bin/python", "-c", script], capture_output=True, text=True
+    )
+    report = {"probe": (probe.stdout or "").strip() or probe.stderr[-900:]}
+
+    # Does tokamax import and autotune at all in this environment?
+    tk = subprocess.run(
+        ["/alphafold3_venv/bin/python", "-c",
+         "import tokamax; print('tokamax imported', tokamax.__version__ "
+         "if hasattr(tokamax, '__version__') else '')"],
+        capture_output=True, text=True,
+    )
+    report["tokamax_import"] = (tk.stdout or "").strip() or tk.stderr[-500:]
+    return report
+
+
 @app.local_entrypoint()
-def main(stage: str = "env"):
-    """`modal run experiments/af3_jax_image.py --stage env|install|check|warm`."""
-    fn = {"env": env, "install": install, "check": check, "warm": warm}[stage]
-    for key, value in fn.remote().items():
+def main(stage: str = "env", mode: str = "exact", n_seeds: int = 2):
+    """`modal run experiments/af3_jax_image.py --stage env|install|check|warm|run_one`.
+
+    `--mode` and `--n-seeds` apply to `run_one` only; the other stages take no
+    arguments.
+    """
+    # Hyphens tolerated: `--stage run-one` is the natural thing to type, while
+    # Modal normalises flag *names* and passes values through verbatim.
+    stage = stage.replace("-", "_")
+    fn = {
+        "env": env,
+        "install": install,
+        "check": check,
+        "warm": warm,
+        "run_one": run_one,
+        "scripts": scripts,
+        "versions": versions,
+    }[stage]
+    result = fn.remote(mode=mode, n_seeds=n_seeds) if stage == "run_one" else fn.remote()
+    for key, value in result.items():
         text = str(value)
         print("\n### " + key + "\n" + text if len(text) > 80 else key + ": " + text)
