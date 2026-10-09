@@ -238,9 +238,20 @@ class TestModelCapabilities:
             CampaignConfig.model_validate(build(raw, refolding={"model": "esmfold2-fast"}))
 
     def test_seed_style_read_from_the_table(self, raw):
+        """Both LIST, including af3_jax. Its `--num_seeds` is optional and the
+        fold-input JSON carries its own `modelSeeds`, so cross-validation's
+        seeds can be ours -- which is what makes a CV run comparable."""
         config = CampaignConfig.model_validate(raw)
         assert config.refolding.seed_style is SeedStyle.LIST
-        assert config.cross_validation.seed_style is SeedStyle.COUNT
+        assert config.cross_validation.seed_style is SeedStyle.LIST
+
+    def test_seed_sequence_matches_what_num_seeds_would_have_derived(self):
+        """`folding_input.py:1514` builds `range(base, base + N)`. Our own
+        helper computes the same list, so choosing the seeds explicitly loses
+        nothing against letting the fork derive them."""
+        from rfd3_pipeline.config import seed_sequence
+
+        assert seed_sequence(7, 5) == list(range(7, 7 + 5))
 
     @pytest.mark.parametrize(
         ("model", "msa", "expected"),

@@ -851,9 +851,18 @@ as the prefix (`:293`), so two sequences sharing a directory resolve to the same
 cached tarball. Its download timeout is also 6.02 s (`:140`), too short for a
 large tarball.
 
-**Seed flags differ per model, and not only in name.** esmfold2 and boltz2 take
-an explicit `--seeds a,b,c`; the AF3 fork takes `--num_seeds N` and *generates*
-the seeds, so the ones actually used are readable only from its output JSON.
+**Seed flags differ per model in name, but every model can be given its seeds
+explicitly.** [corrected 2026-10-09] esmfold2 and boltz2 take `--seeds a,b,c`;
+the AF3 fork carries its own `modelSeeds` list in the fold-input JSON.
+
+The earlier note here -- that the fork "generates the seeds, so the ones used
+are readable only from its output JSON" -- was wrong twice over. `--num_seeds`
+is **optional** (`run_alphafold.py:414-424`: *"If not set, AlphaFold 3 will use
+the seeds as provided in the input JSON"*), and when it *is* set the seeds are
+`range(base, base + N)` (`folding_input.py:1514`) rather than anything random --
+the same list `seed_sequence` already computes. So pass `modelSeeds` explicitly
+and leave `--num_seeds` alone; cross-validation's seeds are then ours and the
+run is comparable, which is the whole point of the stage.
 
 **A refolding model that does not read MSAs is rejected at config time.**
 [settled 2026-10-08] Holo folds the binder against its targets, and a target
@@ -873,6 +882,72 @@ and refuse it for this role, rather than the choice silently degrading holo.
 **`supports_templates=False` for boltz2 is a deliberate false, not a measured
 one** -- held that way so a campaign cannot silently request something that may
 be ignored. See the table above.
+
+### The af3_jax kit
+
+Probed 2026-10-09: **env, install, check and warm all pass**, and the image
+built in **435 s** against ESMFold2's 2615 -- no CUDA extensions from source,
+only the stock alphafold3 wheel.
+
+**Its own checkout, `~/ubm_af3`.** One shared `~/ubm` was tried and rejected:
+`context_dir` must be the parent of `common/opt_core`, so it cannot be narrowed
+per kit, and **Modal hashes the `ignore` spec itself** rather than the
+post-ignore file set -- verified on a throwaway image, where two builds with
+identical contexts, ignoring only paths that do not exist, produced different
+image ids. Consolidating would cost a 38-minute ESMFold2 rebuild to save
+306 MB.
+
+**The same two ESMFold2 traps apply.** Clone with `core.autocrlf=false`, and
+supply an empty `_jitcache/af3_jax-empty-jit.tar`, because this Dockerfile has
+the identical optional-COPY glob (line 101) that Modal refuses.
+
+**`WHEELS_FROM=prebuilt` accepts a wheel you built yourself**, via
+`--build-arg STOCK_WHEEL_SHA256=<sha256>` -- the Dockerfile says plainly that "a
+source build never repeats its bytes". ESMFold2's equivalent only compared
+against `PINS.json`, which is why banking wheels was impossible there.
+
+**Two venvs.** `/alphafold3_venv` holds upstream and JAX (0.10.2, sees the
+GPU); `/kit/venv` holds the kit. `import jax` from the wrong one looks like a
+broken image.
+
+**`warm` takes `--input_dir`, and it must be the directory holding the JSONs.**
+Passing its parent warmed nothing while the inner run logged `rc=0`, surfacing
+as `WARM PARTIAL ... executables=0 predictions=0` with `run.sh` exiting 3.
+`cache_sha256=e3b0c442...` is the giveaway: that is the digest of empty input.
+With the right directory: `WARM PASS`, 25 predictions, 409 kernels, 2.3 MB.
+
+**The JIT cache key embeds the GPU model and JAX version**
+(`NVIDIA_A100-SXM4-40GB__jax0.10.2_jaxlib0.10.2`), so a cache warmed on one
+card does not serve another -- worth knowing before changing
+`cross_validation.gpu`. It also compiles **per token bucket** (64..5120 in steps
+of 64), which is what makes a persistent cache worth having across thousands of
+predictions.
+
+**Native AF3 weights are not a config flip.** [verified 2026-10-09] `install`
+fetches `of3-p2-155k.pt`, an *OpenFold3* checkpoint, and converts it to
+`p2/of3_ported_weights.bin.zst`. `VARIANTS = ("p2",)` is the only variant,
+`PARAMS_FILE` is literally `of3_ported_weights.bin.zst`, and the only converter
+shipped is `convert_of3_weights.py`. A caller's own directory is accepted via
+`--model_dir` -- "always accepted, digested", reported **NOT PINNED** -- but it
+must hold that file in that format. So approval for native weights removes the
+licensing barrier and leaves a weights-conversion problem. Cross-validation on
+OpenFold3 weights is still a genuinely independent model from ESMFold2, which is
+what the stage is for.
+
+**The fold-input schema is not ESMFold2's.** A directory of JSONs, each:
+
+```json
+{"dialect": ..., "version": ..., "name": ...,
+ "modelSeeds": [1, 2, 3, 4, 5],
+ "sequences": [{"protein": {"id": "A", "sequence": "...",
+                            "unpairedMsa": "", "pairedMsa": "",
+                            "templates": []}}]}
+```
+
+MSAs are **inline strings in camelCase**, not file paths as in ESMFold2, and
+`""` is the suppression value -- an empty string counts as *set*, so
+`fill_missing_msas` skips it. The kit's own example ships with both empty, i.e.
+fetching deliberately off.
 
 ---
 
