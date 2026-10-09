@@ -125,16 +125,28 @@ refolding:
   threshold_ipTM: 0.3
 
 cross_validation:                # was `cross-validation`; hyphen is awkward in Python
-  model: af3_jax
-  variant: p2                    # names the checkpoint the kit loads
+  # The sokrypton/alphafold3 fork driven directly, not the af3_jax kit. The kit
+  # exits `5 kernels_refused` in every mode -- its own lock pins tokamax 0.0.12
+  # against an MLIR that dropped the accessor tokamax calls -- while this one
+  # ran clean end to end on 2026-10-09. Switching back is one word, and the
+  # capability rows differ in what they accept, so a stale `variant`/`mode`
+  # will be rejected rather than ignored.
+  model: af3_fork
+  # No `variant`: the fork names its weights directory outright via
+  # `--model_dir`, so there is nothing for a variant to select.
   weights: openfold3             # openfold3 | af3_native -- see note below
-  mode: exact
+  # No `mode` or `n_gpu_shard` either; both are kit concepts. `n_gpu_shard`
+  # other than 1 is rejected for a directly-called model rather than silently
+  # doing nothing.
   gpu: A100-80GB
-  n_gpu_shard: 1
   max_concurrent: 4
   chunk_size: 8
   target_template: false
-  num_seeds: 5                   # seeds derived from general.base_seed
+  # Seeds derived from general.base_seed, passed as the input JSON's
+  # `modelSeeds`. One diffusion sample per seed, so this is 5 predictions per
+  # sequence -- note `--num_diffusion_samples` defaults to 5 upstream, which
+  # would have made it 25.
+  num_seeds: 5
 
 msa:
   host_url: https://api.colabfold.com

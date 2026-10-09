@@ -17,6 +17,8 @@ at import rather than a silent fall-through.
 
 from __future__ import annotations
 
+from string import ascii_letters, digits
+
 from dataclasses import dataclass
 from enum import StrEnum
 from typing import Any, Literal
@@ -80,6 +82,11 @@ class FoldingModel(StrEnum):
     ESMFOLD2_FAST = "esmfold2-fast"
     BOLTZ2 = "boltz2"
     AF3_JAX = "af3_jax"
+    # The sokrypton/alphafold3 fork driven directly, without the Anthropic kit.
+    # A separate member rather than a flag on AF3_JAX because almost nothing is
+    # shared: no `run.sh`, no `--config` card, no `--mode`, no `--variant`, a
+    # different weights layout, and native AF3 weights that actually load.
+    AF3_FORK = "af3_fork"
 
 
 class Weights(StrEnum):
@@ -122,6 +129,14 @@ class SeedStyle(StrEnum):
 class ModelCapabilities:
     """What one folding model supports. One row per model, no conditionals."""
 
+    # Whether this model is driven through an Anthropic optimization kit
+    # (`run.sh`, `--config <card>`, `--mode`, `--variant`) or invoked directly.
+    # Required rather than defaulted, so a new row has to say which it is: the
+    # kit-only rules below -- the GPU needing a card, `--mode` meaning
+    # anything, `n_gpu_shard` sharding a prediction -- are all false for a
+    # model called directly, and silently applying them would restrict GPUs
+    # for no reason and accept settings that reach nothing.
+    uses_kit: bool
     supports_templates: bool
     # Which MSA fields a protein chain carries in this model's input, which is
     # what the caller has to write. Two flags rather than one enum because the
@@ -178,6 +193,7 @@ MODEL_CAPABILITIES: dict[FoldingModel, ModelCapabilities] = {
     # `--variant` conflates model choice with MSA presence, so the campaign
     # names the model and the step supplies the MSA (esmfold2/README.md:72-73).
     FoldingModel.ESMFOLD2: ModelCapabilities(
+        uses_kit=True,
         supports_templates=False,
         # One `"msa"` a3m path per chain (`opt/esmfold2_opt/inputs.py:7-9`);
         # the model pairs internally, so the caller never supplies pairing.
@@ -187,6 +203,7 @@ MODEL_CAPABILITIES: dict[FoldingModel, ModelCapabilities] = {
         derived_variants={False: "full_nomsa", True: "full_msa"},
     ),
     FoldingModel.ESMFOLD2_FAST: ModelCapabilities(
+        uses_kit=True,
         supports_templates=False,
         # Reads no alignments at all, so `consumes_msa` derives to False and
         # the whole MSA cache is inert for a campaign using it.
@@ -196,6 +213,7 @@ MODEL_CAPABILITIES: dict[FoldingModel, ModelCapabilities] = {
         derived_variants={False: "fast", True: "fast"},
     ),
     FoldingModel.BOLTZ2: ModelCapabilities(
+        uses_kit=True,
         # Templates unverified against the kit; left False so a campaign cannot
         # silently request something that may be ignored.
         supports_templates=False,
@@ -209,6 +227,7 @@ MODEL_CAPABILITIES: dict[FoldingModel, ModelCapabilities] = {
         seed_style=SeedStyle.LIST,
     ),
     FoldingModel.AF3_JAX: ModelCapabilities(
+        uses_kit=True,
         supports_templates=True,
         # LIST, not COUNT: the fold-input JSON carries its own `modelSeeds`
         # list, and `--num_seeds` is optional. Passing the list explicitly
@@ -222,6 +241,26 @@ MODEL_CAPABILITIES: dict[FoldingModel, ModelCapabilities] = {
         msa_paired=True,
         seed_style=SeedStyle.LIST,
         fixed_variant="p2",
+        default_weights=Weights.OPENFOLD3,
+    ),
+    # Verified end to end 2026-10-09 on real campaign shards: five seeds at one
+    # diffusion sample each, targets read from the MSA cache, exit 0 and a full
+    # confidence set. See `experiments/af3_fork_image.py`.
+    FoldingModel.AF3_FORK: ModelCapabilities(
+        uses_kit=False,
+        supports_templates=True,
+        # Same fold-input schema as af3_jax -- it is the same upstream code --
+        # so the same two MSA fields per protein chain, and the caller still
+        # owns the pairing.
+        msa_unpaired=True,
+        msa_paired=True,
+        # `modelSeeds` in the input JSON. Measured, not assumed: two runs in
+        # separate containers with seeds 0-4 returned identical metrics.
+        seed_style=SeedStyle.LIST,
+        # No `--variant`: the weights directory is named outright by
+        # `--model_dir`, so there is nothing for a variant to select.
+        # Both sets load into this one codebase, which is the fork's whole
+        # point -- `af3_native` here is a weights choice, not a port.
         default_weights=Weights.OPENFOLD3,
     ),
 }
@@ -327,6 +366,35 @@ class SpecConfig(_Base):
     contig: str
     unindex: str | None = None
     select_fixed_atoms: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("name")
+    @classmethod
+    def _name_survives_a_filename(cls, value: str) -> str:
+        """Every output path in the pipeline descends from this string.
+
+        `name` reaches `design_id`, then `seq_id`, then shard filenames, RFD3
+        output keys and the AF3 fork's job directories. The fork is the strict
+        one: it writes to `sanitised_name()`, dropping anything outside
+        `[A-Za-z0-9_-.]` (`folding_input.py:1031-1035`), so a spec called
+        "rgd core" would have its results land somewhere the pipeline does not
+        look -- and cross-validation would exit 0 while reporting "no output
+        directory" for every sequence. Two names differing only in a stripped
+        character would be worse still: their outputs would collide silently.
+
+        Rejected here rather than sanitised, because quietly renaming a user's
+        spec would make the output directory not match the campaign file.
+        """
+        allowed = set(ascii_letters + digits + "_-.")
+        bad = sorted({character for character in value if character not in allowed})
+        if not value:
+            raise ValueError("spec name must not be empty")
+        if bad:
+            raise ValueError(
+                f"spec name {value!r} contains {bad}, which cannot survive a "
+                f"filename; every output path descends from it. Use letters, "
+                f"digits, underscore, hyphen or dot."
+            )
+        return value
 
     @model_validator(mode="after")
     def _check_selections(self) -> SpecConfig:
@@ -465,19 +533,25 @@ class _FoldingBase(_Base):
     variant: str | None = None
     weights: Weights | None = None
 
-    @field_validator("gpu")
-    @classmethod
-    def _gpu_has_a_kit_card(cls, value: str) -> str:
-        if value not in GPU_TO_CARD:
-            raise ValueError(
-                f"gpu {value!r} has no kit card; folding steps need one of "
-                f"{sorted(GPU_TO_CARD)}. A mode that cannot engage exits 3."
-            )
-        return value
-
     @model_validator(mode="after")
     def _check_folding(self) -> _FoldingBase:
         capabilities = MODEL_CAPABILITIES[self.model]
+
+        # Kit-driven models only. The card is a kit concept, and a model called
+        # directly runs on whatever GPU Modal will give it -- restricting it to
+        # this table would rule out cards that work.
+        if capabilities.uses_kit and self.gpu not in GPU_TO_CARD:
+            raise ValueError(
+                f"gpu {self.gpu!r} has no kit card; {self.model.value} needs one "
+                f"of {sorted(GPU_TO_CARD)}. A mode that cannot engage exits 3."
+            )
+
+        if not capabilities.uses_kit and self.n_gpu_shard != 1:
+            raise ValueError(
+                f"n_gpu_shard={self.n_gpu_shard} is a kit setting and "
+                f"{self.model.value} is called directly; it has no equivalent. "
+                "For concurrency use max_concurrent."
+            )
 
         if self.n_gpu_shard not in VALID_GPU_SHARDS:
             raise ValueError(
@@ -520,7 +594,16 @@ class _FoldingBase(_Base):
 
     @property
     def kit_config(self) -> KitCard:
-        """The `--config` card, derived from the GPU rather than restated."""
+        """The `--config` card, derived from the GPU rather than restated.
+
+        Raises for a model called directly, which has no card. `mode` is in the
+        same position: it is defaulted on this base, so a campaign cannot be
+        stopped from setting it, but nothing reads it for a non-kit model.
+        """
+        if not self.capabilities.uses_kit:
+            raise ValueError(
+                f"{self.model.value} is called directly and has no kit card"
+            )
         return GPU_TO_CARD[self.gpu]
 
     @property

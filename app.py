@@ -43,6 +43,15 @@ ESM_WEIGHTS = f"{WEIGHTS}/esmfold2"
 ESM_JIT = f"{JIT}/esmfold2"
 ESM_KIT = "/kit/esmfold2"
 
+# Cross-validation on the sokrypton/alphafold3 fork, driven directly. Kept
+# apart from `{WEIGHTS}/af3`, which holds the Anthropic kit's own layout, so
+# neither can be mistaken for the other.
+AF3_FORK_ROOT = f"{WEIGHTS}/af3_fork"
+AF3_FORK_OF3 = f"{AF3_FORK_ROOT}/of3"
+AF3_FORK_NATIVE = f"{AF3_FORK_ROOT}/native"
+AF3_FORK_CHECKPOINT = f"{AF3_FORK_ROOT}/of3-p2-155k.pt"
+AF3_FORK_JIT = f"{JIT}/af3_fork"
+
 # The kit's `--config` card follows the GPU, not the model. `GPU_TO_CARD` in
 # config.py is the validated mapping; this is its string form for the CLI.
 GPU_TO_KIT_CARD = {
@@ -158,6 +167,58 @@ esmfold2_image = (
     .add_local_python_source("rfd3_pipeline")
 )
 
+# The fork, driven directly rather than through the af3_jax kit, which exits
+# `5 kernels_refused` in every mode -- see "The af3_jax kit refuses its own
+# kernels" in Notes.md for why, and why it is not fixable from here.
+#
+# No Dockerfile, no checkout, no CUDA build: a published wheel on debian_slim,
+# which builds in about a minute against the kit's 435 s.
+# Pins copied from the user's Optimus repo, which already drives this fork on
+# Modal: a known-working combination, not a floor. jax 0.10.1 and tokamax
+# 0.0.11 are each one minor version below the pair the kit cannot run.
+AF3_FORK_TAG = "v3.1.5"
+AF3_FORK_WHEEL = (
+    f"https://github.com/sokrypton/alphafold3/releases/download/{AF3_FORK_TAG}/"
+    "alphafold3_open-3.1.5-cp313-cp313-manylinux_2_27_x86_64"
+    ".manylinux_2_28_x86_64.whl"
+)
+# `run_alphafold.py` and `convert_of3_weights.py` are not in the wheel -- the
+# fork ships them as standalone scripts. Pinned to the wheel's tag rather than
+# `main`, so a script cannot drift away from the wheel it drives.
+_AF3_FORK_RAW = (
+    f"https://raw.githubusercontent.com/sokrypton/alphafold3/refs/tags/{AF3_FORK_TAG}"
+)
+
+af3_fork_image = (
+    # 3.13 for the cp313 wheel; a cp312 one exists at this tag if some
+    # dependency ever forces 3.12.
+    modal.Image.debian_slim(python_version="3.13")
+    .apt_install("wget")
+    .pip_install(
+        "jax[cuda12]==0.10.1",
+        "tokamax==0.0.11",
+        "dm-haiku==0.0.17",
+        "rdkit==2025.9.4",
+        "zstandard",
+        "awscli",
+        *PROJECT_DEPS,
+    )
+    # CPU-only torch, used solely to convert the OpenFold3 checkpoint. The GPU
+    # belongs to JAX; a CUDA torch here would only contend for its memory.
+    .pip_install("torch", index_url="https://download.pytorch.org/whl/cpu")
+    .run_commands(f"pip install --no-deps '{AF3_FORK_WHEEL}'")
+    .run_commands(
+        f"cd /root && wget -q -O run_alphafold.py {_AF3_FORK_RAW}/run_alphafold.py",
+        "cd /root && wget -q -O convert_of3_weights.py "
+        f"{_AF3_FORK_RAW}/convert_of3_weights.py",
+    )
+    # The chemical-components database: weight-independent and one-time, so it
+    # belongs in a layer. The official AF3 Dockerfile also runs it at build.
+    .run_commands("cd /root && build_data")
+    .env({"PYTHONUNBUFFERED": "1"})
+    .add_local_python_source("rfd3_pipeline")
+)
+
 HOUR = 60 * 60
 
 
@@ -166,6 +227,7 @@ def _stream(
     *,
     timeout: int,
     cwd: str | None = None,
+    env: dict[str, str] | None = None,
     tail_lines: int = 60,
 ) -> tuple[int, str]:
     """Run a command, echoing its output so the Modal log view shows progress.
@@ -175,7 +237,11 @@ def _stream(
     one. Lines are printed as they arrive; a bounded tail is still returned for
     the report. stderr is merged into stdout to keep the interleaving the
     subprocess intended.
+
+    `env` is merged over the inherited environment rather than replacing it --
+    the fork needs one `XLA_FLAGS` entry added, not a bare environment.
     """
+    import os
     import subprocess
     import threading
     from collections import deque
@@ -188,6 +254,7 @@ def _stream(
         text=True,
         bufsize=1,
         cwd=cwd,
+        env={**os.environ, **env} if env else None,
     )
     # A watchdog rather than a deadline checked per line, so a process that
     # hangs while printing nothing is still killed.
@@ -745,41 +812,59 @@ def build_msa_cache(campaign_payload: dict, force: bool = False) -> dict:
     }
 
 
-def _target_msa_paths(campaign, sequences: dict[str, str], work) -> dict[str, str]:
-    """Stage each target's cached a3m beside the input JSON, keyed by chain.
+def _target_alignments(campaign, sequences: dict[str, str], *, stage_into=None) -> dict[str, str]:
+    """Each target chain's cached a3m, keyed by chain.
 
-    The kit reads `"msa"` as a path relative to the input JSON
-    (`esmfold2/README.md`), and its own example writes `"msas/B.a3m"`, so the
-    alignments are copied next to the JSON under that layout rather than
-    referenced in place on the volume.
+    Shared by holo and cross-validation, which want the same alignments by two
+    different conventions -- hence `stage_into` rather than two functions:
 
-    Raises when one is missing. Holo without its target alignments would fold
-    the targets from sequence alone and still produce interface numbers, which
-    is the failure worth being loud about.
+    * `stage_into=<dir>` copies each a3m there and returns paths *relative* to
+      it. The ESMFold2 kit reads `"msa"` relative to the input JSON
+      (`esmfold2/README.md`) and its own example writes `"msas/B.a3m"`.
+    * `stage_into=None` returns absolute paths on the volume, which is what the
+      AF3 fork wants. It resolves a relative path against the JSON's directory
+      (`folding_input._read_file`) -- the trap RFD3's `input` had -- and reads
+      gzip/xz/zstd by magic number, so nothing needs copying or decompressing.
+
+    Raises when one is missing. Folding without a target's alignment would
+    build it from sequence alone and still produce interface numbers, which is
+    the failure worth being loud about.
     """
-    from rfd3_pipeline.msa import cache_key, read_cached_a3m
+    from rfd3_pipeline.msa import a3m_cache_path, cache_key, read_cached_a3m
 
     msa = campaign.msa
     cache_dir = Path(DATA) / campaign.general.name_design_campaign / "msa_cache"
-    staged = work / "msas"
-    staged.mkdir(parents=True, exist_ok=True)
+    if stage_into is not None:
+        stage_into.mkdir(parents=True, exist_ok=True)
 
     paths: dict[str, str] = {}
     missing: list[str] = []
     for chain, sequence in sequences.items():
         key = cache_key(sequence, use_env=msa.use_env, use_filter=msa.use_filter)
+        if stage_into is None:
+            # Probed by stat rather than read: these alignments run to
+            # thousands of sequences, and reading one in full only to discard
+            # it and let the model read it again costs megabytes per chain per
+            # container. An empty file is a truncated write, worse than a miss.
+            path = a3m_cache_path(cache_dir, key)
+            if not path.is_file() or path.stat().st_size == 0:
+                missing.append(f"{chain} ({key})")
+                continue
+            paths[chain] = str(path)
+            continue
+
         a3m = read_cached_a3m(cache_dir, key)
         if a3m is None:
             missing.append(f"{chain} ({key})")
             continue
-        (staged / f"{chain}.a3m").write_text(a3m)
-        paths[chain] = f"msas/{chain}.a3m"
+        (stage_into / f"{chain}.a3m").write_text(a3m)
+        paths[chain] = f"{stage_into.name}/{chain}.a3m"
 
     if missing:
         raise RuntimeError(
             f"no cached MSA for target chain(s) {', '.join(missing)} under "
             f"{cache_dir}. Run `modal run app.py::cache_msas --campaign <file>` "
-            f"first; folding holo without them would score the binder against "
+            f"first; folding without them would score the binder against "
             f"targets built from sequence alone."
         )
     return paths
@@ -874,7 +959,9 @@ def _refold(seq_ids: list[str], campaign_payload: dict, stage: str) -> dict:
         # Staged only when the model actually reads them, so an esmfold2-fast
         # campaign neither needs a cache nor trips the missing-cache error.
         if MODEL_CAPABILITIES[refolding.model].msa_unpaired:
-            msa_paths = _target_msa_paths(campaign, target_sequences, work)
+            msa_paths = _target_alignments(
+                campaign, target_sequences, stage_into=work / "msas"
+            )
 
     items, prepared, skipped = [], [], []
     for seq_id in seq_ids:
@@ -991,62 +1078,77 @@ def _refold(seq_ids: list[str], campaign_payload: dict, stage: str) -> dict:
     }
 
 
-def _ligand_entries(campaign, structure) -> list[dict]:
-    """The input JSON's ligand chains, derived rather than named in code.
+def _ligand_components(campaign, structure) -> list[tuple[str, int, str]]:
+    """The configured ligand residues, resolved against the input structure.
 
-    `rfd3.ligand` is a reference into the input structure -- `"E703"` means
-    chain E, residue 703 -- so both the chain id and the CCD code come from
-    there. Hardcoding either would be wrong in a way that is hard to see: this
-    campaign's input holds MN in *two* chains, one in D at residue 1004 and
-    three in E at 703-705, and names only E703. Lettering the ligand "after the
-    protein chains" would land on D, a different ion the campaign does not use,
-    at an unrelated residue number.
+    `rfd3.ligand` is a reference *into* that structure -- `"E703"` means chain
+    E, residue 703 -- so both the chain id and the CCD code come from there
+    rather than from code. Hardcoding either would be wrong in a way that is
+    hard to see: this campaign's input holds MN in *two* chains, one in D at
+    1004 and three in E at 703-705, and names only E703. Lettering the ligand
+    "after the protein chains" would land on D, a different ion at an unrelated
+    residue number.
 
     The chain id must also match what RFD3 emitted, since the structural
-    comparisons pair on `(chain, res_id)`. RFD3 preserves the input letter --
+    comparisons pair on (chain, res_id). RFD3 preserves the input letter --
     observed 2026-10-07, output chains `A/B/C/E` -- which is what this relies
     on.
 
-    Shape from `opt/esmfold2_opt/inputs.py:7-9`: `{"type": "ligand", "id": ...,
-    "ccd": [...]}`, with no `sequence` (`inputs.py:63`).
-
-    **One ion only.** ESMFold2 takes a single ligand component here, not a chain
-    of them, so more than one configured ligand residue raises rather than
-    folding against a subset. Note this is a *refolding* limit, not a config
-    error: RFD3 can legitimately be given the whole chain-E triad, and such a
-    campaign would be valid right up to holo. That is why the check lives here
-    rather than in the schema -- but it does mean the failure arrives after RFD3
-    and MPNN have already run.
+    Returns (chain, res_id, ccd_code) per configured residue. The two callers
+    differ in what they *allow*, not in how they look it up, so the limits stay
+    with them: ESMFold2 represents one ligand component and the AF3 fork has no
+    such cap.
     """
     from rfd3_pipeline.contig import parse_residue_selection
 
     if not campaign.rfdiffusion3.ligand:
         return []
 
-    selection = parse_residue_selection(campaign.rfdiffusion3.ligand)
-    if len(selection) > 1:
-        named = ",".join(f"{chain}{res_id}" for chain, res_id in selection)
+    components = []
+    for chain, res_id in parse_residue_selection(campaign.rfdiffusion3.ligand):
+        selected = structure[
+            (structure.chain_id == chain) & (structure.res_id == res_id)
+        ]
+        names = sorted({str(name) for name in selected.res_name})
+        if not names:
+            raise ValueError(
+                f"ligand {chain}{res_id} is not in the input structure; "
+                f"rfd3.ligand names a residue that does not exist"
+            )
+        if len(names) > 1:
+            raise ValueError(
+                f"ligand {chain}{res_id} resolves to several residue names "
+                f"{names}; one position cannot be more than one component"
+            )
+        components.append((chain, res_id, names[0]))
+    return components
+
+
+def _ligand_entries(campaign, structure) -> list[dict]:
+    """ESMFold2's ligand chains. Shape from `opt/esmfold2_opt/inputs.py:7-9`:
+    `{"type": "ligand", "id": ..., "ccd": [...]}`, with no `sequence`.
+
+    **One ion only.** The kit takes a single ligand component here, not a chain
+    of them, so more than one configured residue raises rather than folding
+    against a subset. Note this is a *refolding* limit, not a config error:
+    RFD3 can legitimately be given the whole chain-E triad, and such a campaign
+    is valid right up to holo. That is why the check lives here rather than in
+    the schema -- but it does mean the failure arrives after RFD3 and MPNN have
+    already run. See `_af3_ligand_entries`, which has no such cap.
+    """
+    components = _ligand_components(campaign, structure)
+    if len(components) > 1:
+        named = ",".join(f"{chain}{res_id}" for chain, res_id, _ in components)
         raise ValueError(
-            f"rfd3.ligand names {len(selection)} residues ({named}), and "
+            f"rfd3.ligand names {len(components)} residues ({named}), and "
             f"refolding can represent one ligand component. Folding against a "
             f"subset would score the binder on a complex it was not designed "
             f"for, so name a single residue or split the stage."
         )
-
-    chain, res_id = selection[0]
-    selected = structure[(structure.chain_id == chain) & (structure.res_id == res_id)]
-    names = sorted({str(name) for name in selected.res_name})
-    if not names:
-        raise ValueError(
-            f"ligand {chain}{res_id} is not in the input structure; "
-            f"rfd3.ligand names a residue that does not exist"
-        )
-    if len(names) > 1:
-        raise ValueError(
-            f"ligand {chain}{res_id} resolves to several residue names "
-            f"{names}; one position cannot be more than one component"
-        )
-    return [{"type": "ligand", "id": chain, "ccd": [names[0]]}]
+    return [
+        {"type": "ligand", "id": chain, "ccd": [ccd]}
+        for chain, _, ccd in components
+    ]
 
 
 def _pred_rows(path) -> dict:
@@ -1128,11 +1230,49 @@ def _refold_metrics(seq_id, stage, row, out_dir, root, binder, campaign) -> dict
             metrics[f"{prefix}rmsd_to_design"] = None
             metrics[f"{prefix}rmsd_error"] = f"{type(error).__name__}: {error}"
 
-    # One gate is available from apo alone. `threshold_rmsd_apo_holo` and
-    # `threshold_ipTM` need holo, so they are not evaluated here.
+    # Only one gate is available from apo alone; the other two need both
+    # structures, so they are evaluated in the holo branch below.
     plddt = metrics.get(f"{prefix}plddt_binder")
     if stage == "apo" and plddt is not None:
         metrics["apo_pass"] = plddt >= campaign.refolding.threshold_plddt_binder
+
+    if stage == "holo":
+        # Did binding change the fold? A binder whose apo and holo backbones
+        # disagree was not folding into one shape, so its interface numbers
+        # describe a conformation the apo gate never vetted. Apo's structure is
+        # kept on the volume by the caller for exactly this comparison.
+        apo_cifs = sorted((root / "apo" / seq_id).glob("*.cif")) if seq_id else []
+        if apo_cifs:
+            try:
+                from rfd3_pipeline.metrics.rmsd import superimpose_rmsd
+
+                apo = load_structure(apo_cifs[0])
+                apo_ca, holo_ca, _ = match_ca(apo, predicted, chains=[binder])
+                metrics["holo_rmsd_apo_holo"] = superimpose_rmsd(apo_ca, holo_ca)
+            except Exception as error:
+                metrics["holo_rmsd_apo_holo"] = None
+                metrics["holo_rmsd_apo_holo_error"] = f"{type(error).__name__}: {error}"
+        else:
+            metrics["holo_rmsd_apo_holo"] = None
+
+        # Both thresholds, and both must hold. Each is recorded next to its
+        # verdict: a row that says only `holo_pass: False` cannot be argued
+        # with, and these two gates decide whether the most expensive stage in
+        # the pipeline runs at all.
+        thresholds = campaign.refolding
+        iptm = metrics.get(f"{prefix}iptm")
+        drift = metrics.get("holo_rmsd_apo_holo")
+        checks = {
+            "holo_pass_iptm": None if iptm is None else iptm >= thresholds.threshold_ipTM,
+            "holo_pass_rmsd": (
+                None if drift is None else drift <= thresholds.threshold_rmsd_apo_holo
+            ),
+        }
+        metrics.update(checks)
+        # A missing measurement is not a pass. Unknown fails closed here
+        # because the next stage is cross-validation, and spending it on a
+        # sequence whose interface could not be measured buys nothing.
+        metrics["holo_pass"] = all(value is True for value in checks.values())
     return metrics
 
 
@@ -1168,6 +1308,572 @@ def install_esm_jit() -> dict:
 
 
 REFOLD_FUNCTIONS["esmfold2"] = refold_esmfold2
+
+
+# ---------------------------------------------------------------------------
+# Cross-validation
+# ---------------------------------------------------------------------------
+# One function per model, for the same reason as `REFOLD_FUNCTIONS`: a Modal
+# function's image is fixed at decoration time. Cross-validation is guaranteed
+# to need a different image from refolding, because `CampaignConfig` rejects a
+# campaign whose two stages name the same model.
+CV_FUNCTIONS: dict[str, object] = {}
+
+# What cross-validation owns, dropped from a shard before its own are written.
+# Narrower than the refolding stages' lists because nothing runs after it, so
+# there is nothing downstream to supersede.
+CV_SUPERSEDES = ("cv_", "rank_", "cluster_")
+
+
+def _af3_ligand_entries(campaign, structure) -> list[dict]:
+    """The fork's ligand chains: `{"ligand": {"id": ..., "ccdCodes": [...]}}`.
+
+    AF3 wraps entities by type and names components by CCD code
+    (`docs/input.md:93-96`), and unlike ESMFold2 it accepts several -- so no
+    cap here, and a campaign folding the whole chain-E triad reaches this stage
+    intact.
+    """
+    return [
+        {"ligand": {"id": chain, "ccdCodes": [ccd]}}
+        for chain, _, ccd in _ligand_components(campaign, structure)
+    ]
+
+
+def _cv_fold_inputs(seq_ids, by_seq, campaign, resolved, alignments, ligands, in_dir):
+    """Write one AF3 fold-input JSON per sequence.
+
+    Returns (prepared, skipped, seeds). The fork's schema, which is not
+    ESMFold2's: entities wrapped by type, MSAs in camelCase, and the seeds
+    carried in the input rather than on the command line.
+    """
+    import json
+
+    from rfd3_pipeline.config import seed_sequence
+
+    binder = campaign.general.chain_binder
+    # Explicit, never `--num_seeds`. The fork uses the input's seeds when the
+    # flag is absent, and when the flag is set it just builds
+    # `range(base, base + n)` -- the same list `seed_sequence` computes. Passing
+    # them keeps cross-validation's seeds ours, which is the point of a stage
+    # whose whole purpose is to be compared against.
+    seeds = seed_sequence(
+        campaign.general.base_seed, campaign.cross_validation.num_seeds
+    )
+
+    prepared, skipped = [], []
+    for seq_id in seq_ids:
+        record = by_seq.get(seq_id)
+        if record is None:
+            skipped.append({"seq_id": seq_id, "reason": "no sequence shard"})
+            continue
+
+        entities: list[dict] = [
+            {
+                "protein": {
+                    "id": binder,
+                    "sequence": record["sequence"],
+                    # A single-sequence stub, not "" and not absent. Absent is
+                    # the one state `fill_missing_msas` reads as "fetch this",
+                    # and a de novo binder has no homologs to find anyway. This
+                    # is what keeps the binder's sequence off the network.
+                    "unpairedMsa": f">query\n{record['sequence']}\n",
+                    "pairedMsa": "",
+                    "templates": [],
+                }
+            }
+        ]
+        for chain in campaign.general.chain_targets:
+            entities.append(
+                {
+                    "protein": {
+                        "id": chain,
+                        "sequence": resolved.target_sequences[chain],
+                        "unpairedMsaPath": alignments[chain],
+                        # Unpaired only: the cache does not hold paired
+                        # alignments. "" counts as *set*, so this suppresses
+                        # pairing rather than triggering a search for it.
+                        "pairedMsa": "",
+                        "templates": [],
+                    }
+                }
+            )
+        entities.extend(ligands)
+
+        payload = {
+            "dialect": "alphafold3",
+            # 1 through 4 are all accepted (`folding_input.JSON_VERSIONS`).
+            "version": 1,
+            # Names the output directory, so results stay addressable by seq_id.
+            "name": seq_id,
+            "modelSeeds": seeds,
+            "sequences": entities,
+        }
+        (in_dir / f"{seq_id}.json").write_text(json.dumps(payload, indent=2))
+        prepared.append(seq_id)
+
+    # Two sequences whose names strip to one directory would overwrite each
+    # other's results silently, so this is checked rather than trusted. It
+    # should be unreachable while `SpecConfig.name` holds.
+    by_job: dict[str, list[str]] = {}
+    for seq_id in prepared:
+        by_job.setdefault(_af3_job_name(seq_id), []).append(seq_id)
+    collisions = {job: ids for job, ids in by_job.items() if len(ids) > 1}
+    if collisions:
+        raise ValueError(
+            f"sequence ids collide once the fork sanitises them: {collisions}. "
+            f"Their results would overwrite each other in one output directory."
+        )
+    return prepared, skipped, seeds
+
+
+def _cv_metrics(seq_id, job_dir, root, binder, seeds) -> dict:
+    """The `cv_*` columns for one sequence.
+
+    Reported across all seeds rather than from the best one alone. A single
+    best score cannot distinguish a model that is confident from one that is
+    confident once in five, and cross-validation exists to answer exactly that.
+    Every field is optional on purpose: a missing metric should leave a null in
+    the summary rather than lose the chunk.
+    """
+    import json
+
+    metrics: dict[str, object] = {"cv_n_seeds_requested": len(seeds)}
+    if not job_dir.is_dir():
+        metrics["cv_error"] = "no output directory"
+        return metrics
+
+    per_seed = []
+    for seed in seeds:
+        for summary in sorted(
+            job_dir.glob(f"seed-{seed}_sample-*/*_summary_confidences.json")
+        ):
+            try:
+                per_seed.append((seed, json.loads(summary.read_text()), summary.parent))
+            except Exception:
+                continue
+    metrics["cv_n_seeds_ok"] = len(per_seed)
+    if not per_seed:
+        metrics["cv_error"] = "no summary_confidences.json produced"
+        return metrics
+
+    def spread(field: str) -> None:
+        values = [
+            float(payload[field])
+            for _, payload, _ in per_seed
+            if payload.get(field) is not None
+        ]
+        if not values:
+            return
+        metrics[f"cv_{field}_mean"] = sum(values) / len(values)
+        metrics[f"cv_{field}_best"] = max(values)
+        metrics[f"cv_{field}_worst"] = min(values)
+
+    for field in ("iptm", "ptm", "ranking_score"):
+        spread(field)
+    metrics["cv_has_clash_any"] = any(
+        bool(payload.get("has_clash")) for _, payload, _ in per_seed
+    )
+
+    # The best-ranked seed carries the structure worth comparing.
+    best_seed, _, best_dir = max(
+        per_seed, key=lambda item: item[1].get("ranking_score", float("-inf"))
+    )
+    metrics["cv_best_seed"] = best_seed
+
+    cifs = sorted(best_dir.glob("*_model.cif"))
+    if not cifs:
+        metrics["cv_structure_error"] = "no model.cif for the best seed"
+        return metrics
+    metrics.update(_cv_structure_metrics(cifs[0], seq_id, root, binder))
+    return metrics
+
+
+def _cv_structure_metrics(cif, seq_id: str, root, binder: str) -> dict:
+    """pLDDT and the comparison against holo, from one predicted structure.
+
+    Model-independent: any cross-validation model produces a CIF and wants
+    these two numbers from it, so this is the half a second model reuses rather
+    than copies. Only locating the CIF is model-specific, and that stays with
+    the caller.
+
+    Both measurements are guarded individually. A format change should cost one
+    column, not the whole record -- and the two failures are recorded as
+    `cv_plddt_error` / `cv_rmsd_error` rather than left as bare nulls, because
+    a null that means "biotite raised" and a null that means "no holo
+    structure" need telling apart.
+    """
+    from rfd3_pipeline.structure import ca_only, chain_subset, load_structure, match_ca
+
+    metrics: dict[str, object] = {}
+    # pLDDT lives in the B-factor column, which biotite does not read unless
+    # asked -- without `extra_fields` the attribute is absent entirely.
+    predicted = load_structure(cif, extra_fields=["b_factor"])
+    try:
+        binder_ca = ca_only(chain_subset(predicted, [binder]))
+        metrics["cv_plddt_binder"] = float(binder_ca.b_factor.mean())
+    except Exception as error:
+        metrics["cv_plddt_binder"] = None
+        metrics["cv_plddt_error"] = f"{type(error).__name__}: {error}"
+
+    # The question the stage exists to answer: does an independent model put
+    # the binder where holo did? Agreement is corroboration; disagreement says
+    # holo's interface was one model's opinion.
+    holo_cifs = sorted((root / "holo" / seq_id).glob("*.cif"))
+    if not holo_cifs:
+        metrics["cv_rmsd_to_holo"] = None
+        return metrics
+    try:
+        from rfd3_pipeline.metrics.rmsd import superimpose_rmsd
+
+        holo = load_structure(holo_cifs[0])
+        holo_ca, cv_ca, _ = match_ca(holo, predicted, chains=[binder])
+        metrics["cv_rmsd_to_holo"] = superimpose_rmsd(holo_ca, cv_ca)
+    except Exception as error:
+        metrics["cv_rmsd_to_holo"] = None
+        metrics["cv_rmsd_error"] = f"{type(error).__name__}: {error}"
+    return metrics
+
+
+def _cv_write_records(
+    prepared: list[str],
+    by_seq: dict,
+    *,
+    shards,
+    root,
+    out_dir,
+    out_root,
+    binder: str,
+    seeds: list[int],
+    metrics,
+    keep,
+    job_dir_of,
+) -> list[str]:
+    """Write one shard per cross-validated sequence and keep its structure.
+
+    Model-independent, and the part a second cross-validation model gets for
+    free: superseded columns are dropped, `stage_reached` is set, and the
+    structures named by `keep` are copied off the container's scratch disk onto
+    the volume.
+
+    Three callables, because each model owns its own output layout and none of
+    it need match AF3's `seed-N_sample-M/`:
+
+    * `job_dir_of(out_dir, seq_id)` -- where that sequence's results landed.
+      Not `out_dir / seq_id`: a model is free to rename the job, and the fork
+      does (see `_af3_job_name`).
+    * `metrics(seq_id, job_dir, root, binder, seeds) -> dict` -- read them.
+    * `keep(record) -> list[str]` -- globs worth retaining, relative to
+      `job_dir`.
+    """
+    from rfd3_pipeline.gates import Stage
+    from rfd3_pipeline.report import write_shard
+
+    written = []
+    out_root.mkdir(parents=True, exist_ok=True)
+    for seq_id in prepared:
+        job_dir = job_dir_of(out_dir, seq_id)
+        record = {
+            key: value
+            for key, value in by_seq[seq_id].items()
+            if not key.startswith(CV_SUPERSEDES)
+        }
+        record.update(metrics(seq_id, job_dir, root, binder, seeds))
+        record["stage_reached"] = Stage.CV
+        write_shard(record, shards)
+        written.append(seq_id)
+
+        for pattern in keep(record):
+            for path in job_dir.glob(pattern):
+                (out_root / seq_id).mkdir(parents=True, exist_ok=True)
+                (out_root / seq_id / path.name).write_bytes(path.read_bytes())
+    return written
+
+
+def _af3_job_name(seq_id: str) -> str:
+    """Where the fork actually writes this job's output.
+
+    `run_alphafold.py` names the directory after `sanitised_name()`, not after
+    the name it was given (`folding_input.py:1031-1035`): spaces become
+    underscores and anything outside `[A-Za-z0-9_-.]` is dropped. Those
+    characters are rejected by `SpecConfig.name` so this should be the identity
+    function -- it exists because the consequence of being wrong is silent.
+    A mismatch produces `cv_error: no output directory` for every sequence
+    while the run exits 0, which looks like a model failure rather than a
+    naming one.
+    """
+    import string
+
+    allowed = set(string.ascii_letters + string.digits + "_-.")
+    return "".join(c for c in seq_id.replace(" ", "_") if c in allowed)
+
+
+def _af3_keep(record: dict) -> list[str]:
+    """The best seed's structure, and nothing else.
+
+    Five CIFs per sequence across a campaign is a lot of volume for a
+    comparison already reduced to `cv_rmsd_to_holo`.
+    """
+    best = record.get("cv_best_seed")
+    if best is None:
+        return []
+    return [
+        f"seed-{best}_sample-*/*_model.cif",
+        f"seed-{best}_sample-*/*_summary_confidences.json",
+        "*_ranking_scores.csv",
+    ]
+
+
+def _cross_validate_af3(seq_ids: list[str], campaign_payload: dict) -> dict:
+    """Refold holo's survivors with the AF3 fork, on seeds we chose.
+
+    **AF3-specific, despite being the only cross-validation implementation.**
+    Named for the model rather than for the stage so that is not mistaken: the
+    fold-input schema, the `run_alphafold.py` command line and the output
+    layout all live here or in the helpers above.
+
+    To add another cross-validation model -- as an *alternative* to this one,
+    since `cross_validation.model` names exactly one -- you need all of:
+
+    * an image, weight paths and a `populate_*_weights` function, next to
+      `af3_fork_image`;
+    * four model-specific pieces: an input writer (`_cv_fold_inputs`), a
+      ligand builder (`_af3_ligand_entries`), a metrics reader (`_cv_metrics`)
+      and a retention policy (`_af3_keep`);
+    * this function, an `@app.function` wrapper, and a `CV_FUNCTIONS` entry
+      keyed by the model's `FoldingModel` value;
+    * a `MODEL_CAPABILITIES` row, including `uses_kit` -- which decides whether
+      `--config`, `--mode` and `n_gpu_shard` mean anything for it.
+
+    What you get for free is the model-independent half: `_target_alignments`
+    for the cached MSAs, `_ligand_components` for the residue lookup,
+    `_cv_write_records` for shards and structure retention, `_cv_structure_metrics`
+    for pLDDT and the holo comparison, and the sequence selection in
+    `orchestrate`.
+
+    Two things to know before copying this function. `_cv_write_records` reads
+    `cv_best_seed` off the record, which is an AF3 notion -- a model without
+    seeds should write its own key and its own `keep`. And `CV_SUPERSEDES` is
+    keyed on the *stage*, not the model, so two models cannot write `cv_*`
+    columns side by side; swapping models supersedes the previous one's
+    results, which is the intent.
+    """
+    import shutil
+    import tempfile
+
+    from rfd3_pipeline.config import Weights
+    from rfd3_pipeline.gpu import attention_tuning
+    from rfd3_pipeline.report import read_shards
+    from rfd3_pipeline.spec import resolve_campaign
+    from rfd3_pipeline.structure import load_structure
+
+    # The volume is read by a long-lived container, and `commit()` makes a
+    # write durable without pushing it into a reader already running.
+    data_volume.reload()
+    weights_volume.reload()
+
+    campaign = _campaign_from(campaign_payload)
+    cv = campaign.cross_validation
+    root = Path(_run_root(campaign))
+    shards = root / "shards"
+    # A fresh directory per call, not a fixed `/tmp/cv`. `--input_dir` folds
+    # every JSON it finds, and Modal reuses one container across `.map()`
+    # inputs -- so a directory that survives between chunks means chunk k
+    # re-folds chunks 1..k. That is quadratic GPU spend, and silent, because
+    # every extra prediction succeeds and simply overwrites its own output.
+    work = Path(tempfile.mkdtemp(prefix="cv-", dir="/tmp"))
+    in_dir, out_dir = work / "in", work / "out"
+    in_dir.mkdir(parents=True)
+
+    by_seq = {
+        record["seq_id"]: record
+        for record in read_shards(shards)
+        if record.get("seq_id") and record.get("sequence")
+    }
+    resolved = resolve_campaign(campaign, structure_root=DATA)
+
+    # Absolute paths on the volume, resolved once per container and shared by
+    # every sequence in the chunk. See `_target_alignments` for why absolute,
+    # and why a path rather than the alignment text.
+    alignments = _target_alignments(campaign, dict(resolved.target_sequences))
+    ligands = _af3_ligand_entries(campaign, load_structure(resolved.structure_path))
+
+    prepared, skipped, seeds = _cv_fold_inputs(
+        seq_ids, by_seq, campaign, resolved, alignments, ligands, in_dir
+    )
+    if not prepared:
+        return {"returncode": 0, "stage": "cv", "n_written": 0, "skipped": skipped}
+
+    native = cv.weights is Weights.AF3_NATIVE
+    implementation, xla_flags, nojit = attention_tuning()
+    Path(AF3_FORK_JIT).mkdir(parents=True, exist_ok=True)
+    command = [
+        "python", "run_alphafold.py",
+        # One process for the whole chunk, so the model loads and compiles
+        # once. At ~100 s of start-up that is what chunking exists for.
+        f"--input_dir={in_dir}",
+        f"--output_dir={out_dir}",
+        f"--model_dir={AF3_FORK_NATIVE if native else AF3_FORK_OF3}",
+        f"--cache_dir={AF3_FORK_JIT}",
+        # Never AF3's own genetic search, which wants the local databases this
+        # fork exists to avoid -- and never `--use_msa_server`, since every
+        # chain's alignment is already decided above.
+        "--norun_data_pipeline",
+        # Without this a re-run appends a timestamp to the job directory, and
+        # the output stops being addressable by seq_id.
+        "--force_output_dir",
+        f"--flash_attention_implementation={implementation}",
+        # AF3's own default, and the reference notebook's. Not configurable
+        # because nothing has yet suggested a reason to vary it; if that
+        # changes it belongs on `CrossValidationConfig`, not here.
+        "--num_recycles=10",
+        # One sample per seed. The flag's own default is 5, so leaving it alone
+        # would turn five seeds into twenty-five predictions per sequence.
+        "--num_diffusion_samples=1",
+    ]
+    if nojit:
+        command.append("--nojit")
+    if not native:
+        # Needed even with pre-converted weights: it selects OF3-compatible
+        # model settings, not merely the conversion.
+        command.append("--of3_weights")
+
+    print(
+        f"cv: {len(prepared)} sequence(s), {len(seeds)} seed(s) {seeds}, "
+        f"weights {cv.weights.value}, attention {implementation}"
+        + (f", ligand chains {[e['ligand']['id'] for e in ligands]}" if ligands else ""),
+        flush=True,
+    )
+    returncode, output_tail = _stream(
+        command,
+        timeout=6 * HOUR,
+        cwd="/root",
+        env={"XLA_FLAGS": " ".join(xla_flags)} if xla_flags else None,
+    )
+
+    # Written whatever the exit code. The af3_jax probe learned this the other
+    # way round -- the kit's `rc=5` came with ten complete predictions, and
+    # returning early would have thrown them away. One malformed input in a
+    # chunk of sixteen should not discard the fifteen that folded, so
+    # `_cv_metrics` records a per-sequence `cv_error` instead.
+    written = _cv_write_records(
+        prepared,
+        by_seq,
+        shards=shards,
+        root=root,
+        out_dir=out_dir,
+        out_root=root / "cv",
+        binder=campaign.general.chain_binder,
+        seeds=seeds,
+        metrics=_cv_metrics,
+        keep=_af3_keep,
+        job_dir_of=lambda out, seq_id: out / _af3_job_name(seq_id),
+    )
+
+    data_volume.commit()
+    # The compiled kernels live on the jit volume and are worth ~100 s of
+    # start-up per container, but only if they are pushed. `install_esm_jit`
+    # commits this volume; without the same call here every container
+    # recompiled from cold.
+    jit_volume.commit()
+    shutil.rmtree(work, ignore_errors=True)
+    print(f"cv: exit {returncode}, {len(written)} record(s)", flush=True)
+    return {
+        "returncode": returncode,
+        "stage": "cv",
+        "weights": cv.weights.value,
+        "seeds": seeds,
+        "n_written": len(written),
+        "skipped": skipped,
+        "output_tail": output_tail,
+    }
+
+
+@app.function(image=af3_fork_image, gpu="A100-80GB", volumes=VOLUMES, timeout=6 * HOUR)
+def cross_validate_af3_fork(seq_ids: list[str], campaign_payload: dict) -> dict:
+    """The fork's wrapper. One per model, because a function's image is fixed
+    at decoration time."""
+    return _cross_validate_af3(seq_ids, campaign_payload)
+
+
+# Memory and CPU for the conversion: the checkpoint is thousands of tensors
+# read into RAM at once, and the two downloads are the rest of the wall time.
+@app.function(
+    image=af3_fork_image, volumes=VOLUMES, timeout=2 * HOUR, cpu=4.0, memory=32768
+)
+def populate_af3_fork_weights(native: bool = False) -> dict:
+    """Land the fork's weights on the volume. Idempotent.
+
+    Each step is skipped when its output already exists, so a re-run after a
+    partial failure costs only the missing piece.
+
+    Two sets, and unlike the af3_jax kit this fork loads either -- which is why
+    `weights: af3_native` is a one-line campaign change here rather than a
+    weights-conversion project. `--native` also fetches the official AlphaFold3
+    parameters; their terms are non-commercial, so they are opt-in and used
+    under the clearance already held for them.
+
+    `--of3_checkpoint` would let `run_alphafold.py` convert on first use and
+    cache into `--model_dir`, but converting here keeps it off the prediction
+    path, where it would be paid once per cold container instead of once ever.
+    """
+    import hashlib
+
+    report: dict[str, object] = {}
+    Path(AF3_FORK_ROOT).mkdir(parents=True, exist_ok=True)
+
+    # OpenFold3: public, unauthenticated, Apache-2.0.
+    if not Path(AF3_FORK_CHECKPOINT).is_file():
+        returncode, tail = _stream(
+            ["aws", "s3", "cp", "s3://openfold/staging/of3-p2-155k.pt",
+             AF3_FORK_CHECKPOINT, "--no-sign-request"],
+            # aws prints a progress line per tick, and a long tail of those
+            # buries every other field in the report.
+            timeout=40 * 60, tail_lines=3,
+        )
+        report["of3_fetch"] = {"returncode": returncode, "tail": tail}
+        if returncode != 0:
+            return report
+    report["of3_checkpoint_bytes"] = Path(AF3_FORK_CHECKPOINT).stat().st_size
+
+    converted = Path(AF3_FORK_OF3).is_dir() and any(Path(AF3_FORK_OF3).glob("*"))
+    if not converted:
+        returncode, tail = _stream(
+            ["python", "convert_of3_weights.py",
+             f"--of3_checkpoint={AF3_FORK_CHECKPOINT}",
+             f"--output_dir={AF3_FORK_OF3}"],
+            cwd="/root", timeout=HOUR,
+        )
+        report["of3_convert"] = {"returncode": returncode, "tail": tail}
+        if returncode != 0:
+            weights_volume.commit()
+            return report
+    report["of3_dir"] = sorted(p.name for p in Path(AF3_FORK_OF3).iterdir())
+
+    if native:
+        Path(AF3_FORK_NATIVE).mkdir(parents=True, exist_ok=True)
+        target = Path(AF3_FORK_NATIVE, "af3.bin.zst")
+        if not target.is_file():
+            returncode, tail = _stream(
+                ["wget", "-q", "-O", str(target),
+                 "https://storage.googleapis.com/alphafold3/af3.bin.zst"],
+                timeout=HOUR,
+            )
+            report["native_fetch"] = {"returncode": returncode, "tail": tail}
+        if target.is_file():
+            digest = hashlib.sha256()
+            with target.open("rb") as handle:
+                for block in iter(lambda: handle.read(1 << 22), b""):
+                    digest.update(block)
+            report["native"] = {
+                "bytes": target.stat().st_size,
+                "sha256": digest.hexdigest()[:16],
+            }
+
+    weights_volume.commit()
+    return report
+
+
+CV_FUNCTIONS["af3_fork"] = cross_validate_af3_fork
 
 
 # ---------------------------------------------------------------------------
@@ -1243,7 +1949,9 @@ def orchestrate(campaign_payload: dict, start_at: str = "rfd3", chunk_size: int 
     print(f"orchestrate: start_at={start_at}, {len(rfd3.specs)} spec(s)", flush=True)
 
     root = Path(_run_root(campaign))
-    stages = Stage.ORDER[: Stage.ORDER.index(Stage.HOLO) + 1]
+    # The whole order now that cross-validation exists. This was truncated at
+    # HOLO while CV was unbuilt, which also made `--start-at cv` unreachable.
+    stages = Stage.ORDER
     if start_at not in stages:
         raise ValueError(f"start_at must be one of {list(stages)}, got {start_at!r}")
     reached = stages.index(start_at)
@@ -1376,6 +2084,48 @@ def orchestrate(campaign_payload: dict, start_at: str = "rfd3", chunk_size: int 
             )
         run_stage("holo", survivors)
 
+    if reached <= stages.index(Stage.CV):
+        # Cross-validation takes holo's survivors. Its own chunking and
+        # concurrency, because it is a different model on a different image
+        # with a different per-process start-up cost.
+        data_volume.reload()
+        cv = campaign.cross_validation
+        validate = CV_FUNCTIONS.get(cv.model.value)
+        if validate is None:
+            raise ValueError(
+                f"no cross-validation function for model {cv.model.value!r}; "
+                f"have {sorted(CV_FUNCTIONS)}. Add an image and a wrapper."
+            )
+        confirmed = _passing_sequences(root, "holo")
+        report["n_passing_holo"] = len(confirmed)
+        chunks = [
+            confirmed[i : i + cv.chunk_size]
+            for i in range(0, len(confirmed), cv.chunk_size)
+        ]
+        print(
+            f"phase cv: {len(confirmed)} sequence(s), {len(chunks)} chunk(s) of "
+            f"up to {cv.chunk_size}, {cv.num_seeds} seed(s) each, model "
+            f"{cv.model.value}, max_concurrent={cv.max_concurrent}",
+            flush=True,
+        )
+        if not confirmed and sequences:
+            # Loud, for the same reason the holo skip is: a phase that silently
+            # does nothing leaves a summary with no cv columns and no
+            # explanation of why.
+            print(
+                f"phase cv: SKIPPED -- 0 sequences passed holo "
+                f"(threshold_ipTM={refolding.threshold_ipTM}, "
+                f"threshold_rmsd_apo_holo={refolding.threshold_rmsd_apo_holo}). "
+                f"Nothing to cross-validate.",
+                flush=True,
+            )
+        if chunks:
+            report["cv"] = list(
+                validate.with_options(
+                    gpu=cv.gpu, max_containers=cv.max_concurrent
+                ).map(chunks, kwargs={"campaign_payload": campaign_payload})
+            )
+
     print("phase reduce", flush=True)
     report["reduce"] = reduce_summaries.remote(campaign_payload)
     print("orchestrate: done", flush=True)
@@ -1434,6 +2184,38 @@ def _passing_designs(root) -> list[str]:
 # ---------------------------------------------------------------------------
 # Local entrypoints
 # ---------------------------------------------------------------------------
+def _check_models_are_wired(campaign) -> None:
+    """Fail now if a configured model has no function to run it.
+
+    `FoldingModel` lists every model the *config* understands, which is a
+    larger set than the ones `app.py` can actually dispatch -- a model needs an
+    image and a wrapper, and only the ones a campaign uses are worth building.
+    Config validation cannot check this itself: the registries live here, and
+    `rfd3_pipeline` must not import `app`.
+
+    Without this, a campaign naming an unwired cross-validation model validates
+    happily and then dies in `orchestrate` *after* RFD3, MPNN, apo and holo
+    have all run -- hours of GPU time to learn about a one-word typo. Checked on
+    the client, where it costs a second.
+    """
+    for stage, model, registry, names in (
+        ("refolding", campaign.refolding.model, REFOLD_FUNCTIONS, "REFOLD_FUNCTIONS"),
+        (
+            "cross_validation",
+            campaign.cross_validation.model,
+            CV_FUNCTIONS,
+            "CV_FUNCTIONS",
+        ),
+    ):
+        if model.value not in registry:
+            raise SystemExit(
+                f"{stage}.model is {model.value!r}, which has no function in "
+                f"{names}; wired models are {sorted(registry)}. Adding one "
+                f"means an image, a wrapper and a registry entry -- see "
+                f"`_cross_validate_af3`'s docstring for the full list."
+            )
+
+
 def _prepare(campaign_path: str, dry_run: bool = False) -> tuple[dict, str, str]:
     """Validate and resolve locally, then upload what the run needs.
 
@@ -1453,6 +2235,7 @@ def _prepare(campaign_path: str, dry_run: bool = False) -> tuple[dict, str, str]
         payload = apply_dry_run(payload)
 
     campaign = CampaignConfig.model_validate(payload)
+    _check_models_are_wired(campaign)
 
     # Printed after validation so the banner reports the settings that will
     # actually run, not the ones requested.
@@ -1528,6 +2311,15 @@ def warm_esm_jit():
 
 
 @app.local_entrypoint()
+def install_af3_fork_weights(native: bool = False):
+    """`--native` also fetches the official AlphaFold3 parameters.
+
+    Opt-in because their terms are non-commercial, unlike OpenFold3's Apache-2.0.
+    """
+    _show(populate_af3_fork_weights.remote(native=native))
+
+
+@app.local_entrypoint()
 def refold_only(campaign: str, stage: str = "apo", dry_run: bool = False, limit: int = 0):
     """Run one refolding stage over the sequences already on the volume.
 
@@ -1537,6 +2329,65 @@ def refold_only(campaign: str, stage: str = "apo", dry_run: bool = False, limit:
     """
     payload, _, _ = _prepare(campaign, dry_run=dry_run)
     _show(_refold_one_stage.remote(payload, stage=stage, limit=limit))
+
+
+@app.local_entrypoint()
+def cross_validate_only(campaign: str, dry_run: bool = False, limit: int = 0):
+    """Cross-validate the sequences holo already confirmed.
+
+    The counterpart to `refold_only`, and useful for the same reason: this is
+    the last stage, so re-running it on its own costs nothing upstream.
+    `--limit N` takes the first N, which is how it gets tried on one sequence
+    rather than on all of them.
+    """
+    payload, _, _ = _prepare(campaign, dry_run=dry_run)
+    _show(_cross_validate_stage.remote(payload, limit=limit))
+
+
+@app.function(image=cpu_image, volumes=VOLUMES, timeout=24 * HOUR)
+def _cross_validate_stage(campaign_payload: dict, limit: int = 0) -> dict:
+    """Pick the sequences and dispatch cross-validation, remotely.
+
+    A thin coordinator rather than part of the entrypoint, so the client is not
+    in the control flow for a long fold.
+    """
+    data_volume.reload()
+
+    campaign = _campaign_from(campaign_payload)
+    cv = campaign.cross_validation
+    root = Path(_run_root(campaign))
+    # Holo's survivors, the same set `orchestrate` would pass. Falling back to
+    # every sequence would quietly spend the most expensive stage in the
+    # pipeline on designs holo already rejected.
+    sequences = _passing_sequences(root, "holo")
+    if limit:
+        sequences = sequences[:limit]
+
+    validate = CV_FUNCTIONS.get(cv.model.value)
+    if validate is None:
+        raise ValueError(
+            f"no cross-validation function for model {cv.model.value!r}; "
+            f"have {sorted(CV_FUNCTIONS)}"
+        )
+
+    chunks = [
+        sequences[i : i + cv.chunk_size]
+        for i in range(0, len(sequences), cv.chunk_size)
+    ]
+    print(
+        f"phase cv: {len(sequences)} sequence(s), {len(chunks)} chunk(s) of up "
+        f"to {cv.chunk_size}, {cv.num_seeds} seed(s) each, model {cv.model.value}",
+        flush=True,
+    )
+    if not chunks:
+        return {"stage": "cv", "n_sequences": 0}
+
+    results = list(
+        validate.with_options(
+            gpu=cv.gpu, max_containers=cv.max_concurrent
+        ).map(chunks, kwargs={"campaign_payload": campaign_payload})
+    )
+    return {"stage": "cv", "n_sequences": len(sequences), "cv": results}
 
 
 @app.function(image=cpu_image, volumes=VOLUMES, timeout=24 * HOUR)

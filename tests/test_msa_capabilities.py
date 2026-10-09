@@ -44,6 +44,7 @@ class TestPairedImpliesUnpaired:
         """Pairing refines per-chain alignments; it does not replace them."""
         with pytest.raises(ValueError, match="msa_paired requires msa_unpaired"):
             ModelCapabilities(
+                uses_kit=True,  # incidental here; this test is about the MSA flags
                 supports_templates=False,
                 msa_unpaired=False,
                 msa_paired=True,
@@ -53,6 +54,7 @@ class TestPairedImpliesUnpaired:
     def test_the_three_legal_combinations_are_accepted(self):
         for unpaired, paired in [(False, False), (True, False), (True, True)]:
             caps = ModelCapabilities(
+                uses_kit=True,  # incidental here; this test is about the MSA flags
                 supports_templates=False,
                 msa_unpaired=unpaired,
                 msa_paired=paired,

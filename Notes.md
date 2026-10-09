@@ -614,7 +614,7 @@ holo.
 
 ---
 
-## 9. Stages not built yet (holo refolding, cross-validation)
+## 9. Holo refolding and cross-validation
 
 Recorded now because the traps are already known and all are the silent kind.
 Verified against upstream source rather than docs, dated per item -- most on
@@ -949,12 +949,230 @@ MSAs are **inline strings in camelCase**, not file paths as in ESMFold2, and
 `fill_missing_msas` skips it. The kit's own example ships with both empty, i.e.
 fetching deliberately off.
 
+### The af3_jax kit refuses its own kernels, in every mode
+
+[verified 2026-10-09] The kit completes its predictions and still exits
+**`5 kernels_refused`** under `--mode fast`, `exact` *and* `off`, with only 3
+of its 16 advertised levers engaged. `--mode off` does not help because the
+failing component sits below the kit's own lever switch.
+
+```
+Tokamax autotune unavailable (RuntimeError: AttributeError:
+  'jaxlib.mlir._mlir_libs._mlir.ir.NameLoc' object has no attribute 'is_a_name')
+```
+
+**It is not a jax/jaxlib mismatch**, which was the first guess and the wrong
+one. Measured inside the running image: `jax`, `jaxlib` and `jax-cuda12-plugin`
+are all **0.10.2**, exactly as `environment/requirements.lock` pins them, and
+tokamax imports cleanly at **0.0.12**.
+
+The second guess was also wrong and is worth recording because it is the kind
+of story that sounds right: *"jaxlib 0.10.2 dropped the `is_a_*` accessors."*
+It did not drop them -- **jaxlib 0.10.1 has none either**, confirmed by
+`[a for a in dir(ir.NameLoc) if "is_a" in a]` returning empty under both. MLIR's
+Python API had already replaced that family with isinstance-style checks. What
+actually differs is that **tokamax 0.0.12 calls one and 0.0.11 does not.**
+
+So it is an upstream pin conflict inside the kit's own lock file, between two
+versions the kit chose, and unpinning means fighting its `check_pins`. The
+practical read: the 13 refused levers are *performance* levers, the predictions
+themselves are complete and correct, and `rc=5` is the kit declining to certify
+a mode rather than a failed fold.
+
+### Cross-validation runs on the fork directly, not the kit
+
+[verified end to end 2026-10-09] `model: af3_fork` drives
+`sokrypton/alphafold3` through `run_alphafold.py`. Prior art: the user's own
+Optimus repo (`modal_common.py`, `RunAlphaFold3.py`), which already does this
+on Modal.
+
+**The image needs no Dockerfile and no checkout.** `debian_slim` plus the
+fork's published wheel, built in about **one minute** against the kit's 435 s
+and ESMFold2's 2615 across six attempts. Nothing is compiled from source.
+
+**Pin to what works, not to latest.** `jax[cuda12]==0.10.1` and
+`tokamax==0.0.11`, copied from Optimus -- one minor version below the kit's
+broken pair on each. v3.1.7 of the fork exists and is tempting (it bundles
+libcifpp's `components.cif`, which would drop the `build_data` build step, and
+publishes to PyPI as `alphafold3_colabfold`), but v3.1.5's own release notes say
+v3.1.4 -> v3.1.5 was *"packaging only, no functional changes to inference"*, so
+there is nothing to gain yet and a working combination to lose.
+
+**`run_alphafold.py` and `convert_of3_weights.py` are not in the wheel.** The
+fork ships them as standalone scripts, fetched separately. Pin them to the
+wheel's **tag**, not `refs/heads/main` as Optimus does, so a script cannot
+drift away from the wheel it drives.
+
+**`build_data` must run** (it writes `ccd.pickle` and
+`chemical_component_sets.pickle`, 51,056 CCD codes). Weight-independent and
+one-time, so it belongs in an image layer -- the official AF3 Dockerfile runs it
+at build too.
+
+**Native AF3 weights are a one-word config change here.** This closes open
+question 4 in the plan, which only looked hard because of the kit.
+`af3.bin.zst` loads into this fork as-is -- 1,020,545,840 B,
+sha256 `74d0258616917cd1...` -- beside the converted OpenFold3 set (1369 MB,
+329 scopes, 368,388,764 elements, identical to the kit's conversion since it is
+the same converter). `weights: af3_native` picks it; the default stays
+`openfold3` so the non-commercial set never arrives by omission.
+
+**Four flags do the work, and three of them are load-bearing:**
+
+* `--norun_data_pipeline` -- never AF3's own genetic search, which wants the
+  local databases this fork exists to avoid.
+* `--force_output_dir` -- without it a re-run appends a timestamp to the job
+  directory, and the output stops being addressable by `seq_id`.
+* `--of3_weights` -- needed **even with pre-converted weights**: it selects
+  OF3-compatible model settings, not merely the conversion.
+* `--num_diffusion_samples=1` -- see the cost note below.
+
+**`--num_diffusion_samples` defaults to 5.** Left alone, `num_seeds: 5` means
+**25 predictions per sequence**, not 5. Seeds vary the whole trajectory where
+samples vary only the diffusion branch, so for a cross-check seeds are the
+better spend: 5 seeds at 1 sample each.
+
+**Attention must be chosen from the GPU's compute capability**, and the
+boundaries are not a tidy ordering. A100 is cc **8.0** exactly and takes Triton
+flash attention; Ada and consumer Ampere (cc 8.6/8.9, e.g. L40S) have too
+little shared memory for its GEMM kernels and must fall back to XLA. So the
+middle test is strict on *both* sides, and `XLA_FLAGS` carries
+`--xla_gpu_enable_triton_gemm=false` either way.
+
+**MSA paths resolve against the JSON's directory**
+(`folding_input._read_file`), the same trap RFD3's `input` had -- so pass
+absolute container paths. `unpairedMsaPath` and `unpairedMsa` are mutually
+exclusive, and the reader auto-detects gzip/xz/zstd by magic number, so a
+compressed cache would work unchanged.
+
+Prefer the **path** over inlining the text: the chain-to-alignment dict is
+built once per container and shared by every design in the chunk, so inlining
+would copy the same ~14k alignment rows into every design's JSON. Probe the
+cache with `stat`, not `read_cached_a3m` -- reading a 9,000-sequence alignment
+in full only to discard it and let AF3 read it again costs megabytes per chain
+per container.
+
+**Measured, not assumed: two runs in separate containers with seeds 0-4
+returned identical metrics.** So `seed_style: LIST` really does buy
+reproducibility here, and `cv_*_worst`/`_best` spread is the model's own
+variation rather than noise in the harness.
+
+### What the MSA cache is worth, measured
+
+[2026-10-09] The same sequence folded twice, once from the cache and once with
+`--use_msa_server`, to see what the cache costs us:
+
+| | cache | `--use_msa_server` |
+|---|---|---|
+| unpaired depth B / C | 9105 / 4481 | 9104 / 4480 |
+| **paired** depth B / C | 0 (suppressed) | **1771 / 1771** |
+| binder A | 1 | 1 (paired 0) |
+| ipTM | 0.71 | 0.71 |
+| pTM | 0.81 | 0.81 |
+| ranking_score | 0.73 | 0.73 |
+| chain_iptm | 0.28 / 0.58 / 0.61 / 0.47 | 0.29 / 0.58 / 0.62 / 0.47 |
+| seconds | 337 | 343 |
+
+Three things follow.
+
+**The cache reproduces the server's unpaired alignment**, off by exactly one
+record in both chains -- a structural off-by-one in how the query sequence is
+counted, not a different search.
+
+**Pairing made no measurable difference on this complex.** 1771 paired rows per
+target chain changed ipTM, pTM and ranking_score not at all, and two
+`chain_iptm` entries by 0.01. That is one sequence on one target pair, so it is
+not a general claim -- but it does mean the unpaired-only cache is **not
+blocking** cross-validation, which is what the open question was.
+
+**`fill_missing_msas` only fetches a chain whose MSA fields are absent.** The
+server run logged *"Querying ColabFold MSA server for 2 unique protein
+sequence(s)"* -- exactly the two targets. The binder's single-sequence stub kept
+it out, which is the mechanism that keeps a de novo sequence off the network,
+and `""` would have done the same. Absent is the one state that fetches.
+
+### The holo gate
+
+[added 2026-10-09] Holo now writes `holo_pass`, which is what cross-validation
+selects on -- previously only `apo_pass` existed, and the two holo thresholds
+sat in the config unused. Both must hold:
+
+* `threshold_ipTM` (0.3) against `holo_iptm`
+* `threshold_rmsd_apo_holo` (4.0) against `holo_rmsd_apo_holo`, computed
+  between apo's and holo's binder CA atoms -- which is why `_refold` keeps
+  apo's structure on the volume.
+
+Each check is recorded beside its verdict (`holo_pass_iptm`,
+`holo_pass_rmsd`), so a row that failed can be argued with. **A missing
+measurement is not a pass**: unknown fails closed, because the next stage is
+the most expensive in the pipeline and spending it on a sequence whose
+interface could not be measured buys nothing.
+
+**First data, 2026-10-09: the RMSD check does the work and ipTM does not.**
+Across four dry-run sequences, ipTM ran 0.735-0.907 -- all far above 0.3 --
+while apo/holo RMSD split them cleanly at 0.64, 0.74, 5.54, 6.44 against a
+threshold of 4.0. So two designs with *strong* interface scores were folding
+into a different shape when bound, and their ipTM described a conformation the
+apo gate never vetted. Whether `threshold_ipTM: 0.3` is doing anything at all
+is an open calibration question on more than four sequences.
+
+### Two schemas, not one, for ligands
+
+`_ligand_entries` (ESMFold2) and `_af3_ligand_entries` (the fork) differ in
+shape *and* in constraint, and the constraint is the reason they are separate
+functions. ESMFold2 takes `{"type": "ligand", "id": ..., "ccd": [...]}` and
+represents a **single** ligand component, so its builder raises on more than one
+configured residue. AF3 takes `{"ligand": {"id": ..., "ccdCodes": [...]}}` and
+has no such limit. Reusing ESMFold2's builder for the fork would impose another
+model's restriction and refuse a campaign folding the whole chain-E triad that
+cross-validation could handle.
+
+Expect `UFFTYPER: Unrecognized atom type: Mn2+2` from RDKit on every
+featurisation. It is noise, not a failure -- the fold completes and the metals
+are placed.
+
 ---
 
 ## 10. Working on `app.py` itself
 
 The two module rules in section 3 are the whole of it, and both were learned the
 expensive way. The module docstring (`app.py:10-19`) states them.
+
+### A container is reused, so a fixed scratch path is a bug
+
+[found 2026-10-09, in review, before it ever ran at scale] Modal runs several
+`.map()` inputs through **one** container, serially -- that is the point of
+`max_containers`. So a function that writes to a fixed path like `/tmp/cv/in`
+and never clears it accumulates across chunks.
+
+That is merely untidy until something consumes the *whole directory*. The AF3
+fork's `--input_dir` folds every JSON it finds, so chunk k would have folded
+chunks 1 through k: **quadratic GPU spend, and completely silent**, because
+every extra prediction succeeds and overwrites its own output. The symptom
+would have been a bill, not an error.
+
+Use `tempfile.mkdtemp()` per call and remove it at the end. The same trap is
+waiting for any stage whose tool takes a directory rather than a file list.
+
+### Commit every volume the function wrote to, not just the data one
+
+[found 2026-10-09, same review] `_cross_validate_af3` pointed the fork's
+`--cache_dir` at the **jit** volume and then committed only `data_volume`, so
+the compiled kernels were discarded at container exit and every cold start paid
+the ~100 s compile again. `install_esm_jit` had always committed `jit_volume`;
+the new stage simply did not.
+
+Cheap rule: if a function names a path under `/weights` or `/jit` *for
+writing*, it owes that volume a `commit()`.
+
+### Write records for whatever finished, whatever the exit code
+
+The af3_jax probe learned this the right way round -- the kit's `rc=5` arrived
+with ten complete predictions, and returning early would have thrown them all
+away. The first version of the cross-validation stage then did exactly what the
+probe had warned against, gating `_cv_write_records` behind `returncode == 0`:
+one malformed input in a chunk of sixteen would have discarded the fifteen
+folds that worked. Per-sequence failures belong in a per-sequence `cv_error`
+column, not in a chunk-wide early return.
 
 One more: **the `experiments/` probe scripts still use `capture_output=True` and
 `stderr_tail`.** They will go blind exactly as `app.py` did. Left as-is on

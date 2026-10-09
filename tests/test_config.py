@@ -25,7 +25,7 @@ class TestCampaignParses:
         assert config.general.chain_binder == "A"
         assert config.general.chain_targets == ["B", "C"]
         assert config.rfdiffusion3.ligand == "E703"
-        assert config.cross_validation.model is FoldingModel.AF3_JAX
+        assert config.cross_validation.model is FoldingModel.AF3_FORK
 
     def test_design_counts(self, raw):
         config = CampaignConfig.model_validate(raw)
@@ -212,10 +212,22 @@ class TestModelCapabilities:
                     build(raw, refolding={"model": model, "target_template": True})
                 )
 
-    def test_af3_defaults_variant_and_weights(self, raw):
+    def test_the_fork_takes_no_variant_and_defaults_its_weights(self, raw):
+        """The shipped campaign cross-validates on `af3_fork`, which names its
+        weights directory outright via `--model_dir` -- so there is no variant
+        to derive, and the default must be the Apache-licensed set rather than
+        the non-commercial one."""
         config = CampaignConfig.model_validate(raw)
-        assert config.cross_validation.variant == "p2"
+        assert config.cross_validation.variant is None
         assert config.cross_validation.weights is Weights.OPENFOLD3
+
+    def test_the_kit_still_derives_its_fixed_variant(self, raw):
+        """`fixed_variant` is filled in when absent, which is what af3_jax
+        relies on and what the fork deliberately does not have."""
+        config = CampaignConfig.model_validate(
+            build(raw, cross_validation={"model": "af3_jax", "mode": "exact"})
+        )
+        assert config.cross_validation.variant == "p2"
 
     def test_weights_rejected_for_single_checkpoint_models(self, raw):
         """Previously only checked on whichever branch nothing else claimed."""

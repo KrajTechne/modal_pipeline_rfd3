@@ -26,22 +26,25 @@ def raw():
 def set_model(block: dict, model: str) -> None:
     """Point a folding block at `model`, dropping fields it must not carry.
 
-    `variant` and `weights` are only accepted for `af3_jax`; a separate
-    validator rejects them otherwise, and it runs first. Without this the
-    mutations below would fail for that unrelated reason rather than the one
-    under test.
+    The two fields have different rules, which is why they are dropped
+    separately. `weights` is accepted by any model shipping several checkpoints
+    -- both AF3 integrations -- while `variant` is accepted only by `af3_jax`,
+    since the fork names its weights directory outright instead. A separate
+    validator rejects each, and those run first, so without this the mutations
+    below would fail for an unrelated reason rather than the one under test.
     """
     block["model"] = model
+    if model not in ("af3_jax", "af3_fork"):
+        block.pop("weights", None)
     if model != "af3_jax":
         block.pop("variant", None)
-        block.pop("weights", None)
 
 
 class TestDistinctModels:
     def test_the_campaign_as_shipped_is_valid(self, raw):
         campaign = CampaignConfig.model_validate(raw)
         assert campaign.refolding.model.value == "esmfold2"
-        assert campaign.cross_validation.model.value == "af3_jax"
+        assert campaign.cross_validation.model.value == "af3_fork"
 
     def test_the_same_model_on_both_sides_is_rejected(self, raw):
         payload = copy.deepcopy(raw)
@@ -63,7 +66,7 @@ class TestDistinctModels:
         set_model(payload["refolding"], "boltz2")
         campaign = CampaignConfig.model_validate(payload)
         assert campaign.refolding.model.value == "boltz2"
-        assert campaign.cross_validation.model.value == "af3_jax"
+        assert campaign.cross_validation.model.value == "af3_fork"
 
     def test_distinct_models_are_accepted_either_way_round(self, raw):
         """Which side runs which model is not this validator's business."""
