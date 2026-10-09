@@ -7,6 +7,7 @@ from conftest import build
 from pydantic import ValidationError
 
 from rfd3_pipeline.config import (
+    IpsaeConfig,
     MODEL_CAPABILITIES,
     CampaignConfig,
     FoldingModel,
@@ -319,9 +320,24 @@ class TestMsa:
 
 
 class TestIpsaeAndMpnn:
-    def test_cutoffs_are_ten_not_fifteen(self, raw):
+    def test_the_pae_cutoff_is_ten(self, raw):
+        """Stricter than the reference implementations' 15, which is why the
+        plan stated it explicitly. The cutoff is not cosmetic: ipSAE counts
+        only residue pairs below it, so cross-validation reads exactly 0 here
+        -- its closest binder-target PAE is 10.6 to 12.8."""
+        assert CampaignConfig.model_validate(raw).ipsae.pae_cutoff == 10.0
+
+    def test_both_folding_stages_read_one_cutoff(self, raw):
+        """One field, so holo and cross-validation cannot diverge -- scores at
+        different cutoffs are not comparable, and comparing them is the point
+        of the stage."""
         config = CampaignConfig.model_validate(raw)
-        assert (config.ipsae.pae_cutoff, config.ipsae.dist_cutoff) == (10.0, 10.0)
+        assert config.ipsae.pae_cutoff == IpsaeConfig().pae_cutoff
+
+    def test_dist_cutoff_is_recorded_but_unconsumed(self, raw):
+        """`metrics/ipsae.py` is PAE-only. Kept so the intended value is not
+        lost, but tuning it changes nothing today."""
+        assert CampaignConfig.model_validate(raw).ipsae.dist_cutoff == 10.0
 
     def test_mpnn_defaults_to_soluble(self, raw):
         assert CampaignConfig.model_validate(raw).mpnn.mpnn_type is MpnnType.SOLUBLE

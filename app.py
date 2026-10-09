@@ -272,6 +272,23 @@ def _stream(
     return process.wait(), "\n".join(tail)
 
 
+def _sequence_records(shards) -> dict[str, dict]:
+    """Every MPNN sequence on the volume, keyed by `seq_id`.
+
+    Shared by the refolding and cross-validation stages, which both need the
+    whole set to look up the handful in their chunk. Records without a
+    `sequence` are dropped: those are backbone shards, which describe the same
+    design at an earlier stage and have nothing to fold.
+    """
+    from rfd3_pipeline.report import read_shards
+
+    return {
+        record["seq_id"]: record
+        for record in read_shards(shards)
+        if record.get("seq_id") and record.get("sequence")
+    }
+
+
 def _campaign_from(payload: dict):
     """Re-validate the campaign on this side of the boundary."""
     from rfd3_pipeline.config import CampaignConfig
@@ -660,7 +677,12 @@ def filter_designs(design_ids: list[str], campaign_payload: dict) -> dict:
 
     from rfd3_pipeline.filters import backbone_record
     from rfd3_pipeline.report import write_shard
-    from rfd3_pipeline.spec import load_design_metadata, resolve_campaign
+    from rfd3_pipeline.spec import (
+        assert_output_chains,
+        load_design_metadata,
+        renumber_hotspots_for_design,
+        resolve_campaign,
+    )
     from rfd3_pipeline.structure import load_structure
 
     campaign = _campaign_from(campaign_payload)
@@ -684,7 +706,23 @@ def filter_designs(design_ids: list[str], campaign_payload: dict) -> dict:
             structure = load_structure(out_dir / f"{design_id}.cif.gz")
             spec = by_name[_spec_of(design_id, by_name)]
 
+            # Checked on every design, not once per spec as its docstring
+            # suggests: the test is a set comparison on chain ids of a
+            # structure already loaded, so per-design costs nothing and also
+            # catches one design that deviates. It guards exactly the failure
+            # this pipeline now risks -- "binder first, then targets in contig
+            # order, lettered from A" is derived from how RFD3 renumbers rather
+            # than guaranteed by it, and every ipSAE and placement column is
+            # attributed by chain id. A contig ordered differently would
+            # otherwise yield a whole campaign of plausible numbers against the
+            # wrong chains.
+            _check_hotspot_numbering(metadata, spec, structure, binder)
             record = backbone_record(structure, metadata, spec, campaign)
+            record["bb_non_polymer_chains"] = ",".join(
+                assert_output_chains(
+                    structure, [binder, *campaign.general.chain_targets]
+                )
+            )
             record["design_id"] = design_id
             record["campaign"] = campaign.general.name_design_campaign
             record["run_name"] = campaign.general.run_name
@@ -695,6 +733,50 @@ def filter_designs(design_ids: list[str], campaign_payload: dict) -> dict:
 
     data_volume.commit()
     return {"n_written": len(written), "failures": failed}
+
+
+def _check_hotspot_numbering(metadata, spec, structure, binder: str) -> None:
+    """Verify the hotspots the filter scores are the ones this design placed.
+
+    `bb_hotspot_fraction` is scored against `spec.hotspots_by_output_chain()`,
+    which is computed once per campaign from the **declared** contig.
+    `renumber_hotspots_for_design` instead uses `metadata.sampled_contig` --
+    the contig RFD3 actually realised -- and cross-checks the result against
+    RFD3's own target-chain entries.
+
+    The two agree whenever every hotspot sits in a chain whose numbering cannot
+    shift. On this campaign they do: the contig is
+    `100-120,/0,B1-177,/0,C1-242`, so the variable-length segment is the binder
+    and the hotspots are on B and C, which follow chain breaks and are numbered
+    from 1 independently. They would diverge for a contig with a
+    variable-length segment *before* a hotspot in the same chain, and then the
+    hotspot gate would be scoring the wrong residues while looking perfectly
+    healthy.
+
+    Raised rather than recorded, because a disagreement means the gate's
+    verdict is wrong. `filter_designs` catches per design, so this fails one
+    design loudly instead of losing the chunk.
+    """
+    declared = spec.hotspots_by_output_chain()
+    if not declared:
+        return
+
+    # `spec.hotspots` is already the resolve-time input->output mapping, so its
+    # keys are the input residue keys this wants.
+    mapping = renumber_hotspots_for_design(
+        list(spec.hotspots), spec.contig, metadata, structure=structure
+    )
+    realised: dict[str, list[int]] = {}
+    for chain, res_id in mapping.values():
+        realised.setdefault(chain, []).append(res_id)
+    realised = {chain: sorted(ids) for chain, ids in realised.items()}
+
+    if realised != declared:
+        raise ValueError(
+            f"hotspot numbering from the sampled contig {realised} differs "
+            f"from the campaign's {declared}; `bb_hotspot_fraction` would be "
+            f"scored against residues this design did not place"
+        )
 
 
 def _spec_of(design_id: str, by_name: dict) -> str:
@@ -912,7 +994,7 @@ def _refold(seq_ids: list[str], campaign_payload: dict, stage: str) -> dict:
 
     from rfd3_pipeline.config import MODEL_CAPABILITIES, folding_variant
     from rfd3_pipeline.gates import Stage
-    from rfd3_pipeline.report import read_shards, write_shard
+    from rfd3_pipeline.report import write_shard
 
     data_volume.reload()
 
@@ -934,11 +1016,7 @@ def _refold(seq_ids: list[str], campaign_payload: dict, stage: str) -> dict:
             f"{supplies_msa}; its MODEL_CAPABILITIES row needs filling in"
         )
 
-    by_seq = {
-        record["seq_id"]: record
-        for record in read_shards(shards)
-        if record.get("seq_id") and record.get("sequence")
-    }
+    by_seq = _sequence_records(shards)
 
     # Target sequences come from the input structure once per campaign, not from
     # the shards -- they are identical for every prediction.
@@ -962,6 +1040,12 @@ def _refold(seq_ids: list[str], campaign_payload: dict, stage: str) -> dict:
             msa_paths = _target_alignments(
                 campaign, target_sequences, stage_into=work / "msas"
             )
+
+    # Chain order per sequence, kept because the PAE comes back labelled only
+    # by position (`asym_id` 0..n) and this is the list those indices refer to.
+    # Reconstructing it later from the campaign would be a second source of
+    # truth for something already decided here.
+    layouts: dict[str, list[dict]] = {}
 
     items, prepared, skipped = [], [], []
     for seq_id in seq_ids:
@@ -997,6 +1081,17 @@ def _refold(seq_ids: list[str], campaign_payload: dict, stage: str) -> dict:
 
         chains.extend(ligands)
 
+        layouts[seq_id] = [
+            {
+                "id": chain["id"],
+                "type": chain["type"],
+                # Residue count for a protein; None for a ligand, whose token
+                # count depends on the component and is not worth asserting.
+                "n": len(chain["sequence"]) if chain.get("sequence") else None,
+            }
+            for chain in chains
+        ]
+
         # `id` names the output file, so the result is directly addressable.
         items.append(
             {
@@ -1023,6 +1118,13 @@ def _refold(seq_ids: list[str], campaign_payload: dict, stage: str) -> dict:
         "--variant", variant,
         "--input", str(input_json),
         "--out_dir", str(out_dir),
+        # One seed, deliberately, and not an omission to be "fixed" with a
+        # `refolding.num_seeds`: refolding is a *filter*, and a gate wants one
+        # verdict per sequence rather than a distribution to average. Seeds are
+        # spent where they buy something instead -- cross-validation, which
+        # exists to be compared against and reports its own spread. esmfold2's
+        # capability row is `seed_style: LIST`, so several would be accepted;
+        # the decision is ours, not the model's.
         "--seeds", str(campaign.general.base_seed),
         "--det", "1",
     ]
@@ -1053,7 +1155,8 @@ def _refold(seq_ids: list[str], campaign_payload: dict, stage: str) -> dict:
                 if not key.startswith(superseded)
             }
             metrics = _refold_metrics(
-                seq_id, stage, rows.get(seq_id), out_dir, root, binder, campaign
+                seq_id, stage, rows.get(seq_id), out_dir, root, binder, campaign,
+                layout=layouts.get(seq_id),
             )
             record.update(metrics)
             record["stage_reached"] = getattr(Stage, stage.upper())
@@ -1175,7 +1278,142 @@ def _pred_rows(path) -> dict:
     return rows
 
 
-def _refold_metrics(seq_id, stage, row, out_dir, root, binder, campaign) -> dict:
+def _holo_ipsae(cif, layout: list[dict], binder: str, campaign) -> dict:
+    """ipSAE for a holo prediction, from the PAE written beside the CIF.
+
+    The kit's `*_pae.npz` carries `asym_id`, one 0-based chain index per token,
+    in the order the input JSON listed the chains -- which is what `layout` is.
+    The indices are therefore resolved against that list rather than against
+    the campaign, so a reordering would have to happen in one place to go
+    unnoticed, and the protein block lengths are checked against the sequences
+    that were submitted to make sure it did not.
+
+    Ligands are excluded. A metal ion is a single token, and a one-residue
+    chain yields a defined but meaningless ipSAE -- measured on this campaign,
+    including MN pulled `ipsae_min` from 0.598 to 0.199, because the binder's
+    worst "interface" became the one with the ion.
+    """
+    import numpy as np
+
+    from rfd3_pipeline.metrics.ipsae import cross_chain_pae_floor, ipsae_from_tokens
+
+    pae_path = cif.with_name(f"{cif.stem}_pae.npz")
+    if not pae_path.is_file():
+        return {"holo_ipsae_error": f"no PAE beside {cif.name}"}
+
+    try:
+        with np.load(pae_path) as data:
+            # float16 on disk; the score divides by d0 and squares, so it is
+            # promoted before any arithmetic happens.
+            pae = data["pae"].astype(np.float32)
+            asym = np.asarray(data["asym_id"])
+
+        if int(asym.max()) + 1 != len(layout):
+            raise ValueError(
+                f"PAE holds {int(asym.max()) + 1} chains but the input listed "
+                f"{len(layout)} ({[c['id'] for c in layout]})"
+            )
+
+        # The check that would catch a reordering: every protein block must be
+        # as long as the sequence submitted for it.
+        for index, chain in enumerate(layout):
+            if chain["n"] is None:
+                continue
+            found = int(np.count_nonzero(asym == index))
+            if found != chain["n"]:
+                raise ValueError(
+                    f"chain {chain['id']} was submitted with {chain['n']} "
+                    f"residues but its PAE block holds {found}; the asym_id "
+                    "order does not match the input order"
+                )
+
+        labels = [layout[index]["id"] for index in asym]
+        scores = ipsae_from_tokens(
+            pae,
+            labels,
+            binder_chain=binder,
+            pae_cutoff=campaign.ipsae.pae_cutoff,
+            keep=[chain["id"] for chain in layout if chain["type"] == "protein"],
+            # Binder-centric only. Target-to-target pairs do not involve the
+            # designed chain and grow as (N+1)N, doubled across the two stages.
+            pairs="binder",
+        )
+        # Recorded beside the score so a zero can be read: ipSAE is 0 when no
+        # residue pair falls under the cutoff, which is a real result and not
+        # distinguishable from a mis-slice without this.
+        scores.update(
+            cross_chain_pae_floor(
+                pae, labels, binder,
+                [c["id"] for c in layout
+                 if c["type"] == "protein" and c["id"] != binder],
+            )
+        )
+    except Exception as error:
+        return {"holo_ipsae_error": f"{type(error).__name__}: {error}"}
+    return {f"holo_{name}": value for name, value in scores.items()}
+
+
+def _target_aligned_rmsds(
+    reference, predicted, design_json, binder: str, targets, prefix: str
+) -> dict:
+    """Placement RMSDs: fit on the targets, measure the binder.
+
+    The distinction that matters, and the one the other RMSD columns do not
+    make. `{prefix}rmsd_to_design` superimposes the binder on the binder, so
+    translation and rotation are fitted away and it reports how well the
+    *fold* was reproduced. Aligning on the targets instead leaves the binder's
+    displacement in the measurement, which is what says whether it docked
+    where it was designed to -- `metrics/rmsd.py` puts it plainly: "what makes
+    binder displacement visible instead of being absorbed into the fit".
+
+    Two measurements, because they answer different questions:
+
+    * `rmsd_binder_on_target` over the whole binder chain.
+    * `rmsd_motif_on_target` over the scaffolded motif residues only, which for
+      a motif-scaffolding campaign is the design objective rather than a
+      diagnostic -- the rest of the binder is scaffold and is allowed to move.
+
+    The motif residues come from the design's own metadata
+    (`binder_entries`, RFD3's input-to-output map), so they are the residues
+    that design actually placed rather than the ones the contig asked for.
+    Returns the columns it could compute; a missing metadata file costs the
+    motif column alone.
+    """
+    from rfd3_pipeline.metrics.rmsd import rmsd_binder_on_target, rmsd_motif_on_target
+
+    metrics: dict[str, object] = {}
+    if not targets:
+        return metrics
+
+    try:
+        metrics[f"{prefix}rmsd_binder_on_target"] = rmsd_binder_on_target(
+            reference, predicted, binder, list(targets)
+        )
+    except Exception as error:
+        metrics[f"{prefix}rmsd_binder_on_target"] = None
+        metrics[f"{prefix}rmsd_on_target_error"] = f"{type(error).__name__}: {error}"
+
+    if design_json is None or not design_json.is_file():
+        return metrics
+    try:
+        from rfd3_pipeline.spec import load_design_metadata
+
+        metadata = load_design_metadata(design_json, binder)
+        motif = sorted({res_id for _, res_id in metadata.binder_entries.values()})
+        if motif:
+            metrics[f"{prefix}rmsd_motif_on_target"] = rmsd_motif_on_target(
+                reference, predicted, binder, list(targets), motif
+            )
+            metrics[f"{prefix}n_motif_residues"] = len(motif)
+    except Exception as error:
+        metrics[f"{prefix}rmsd_motif_on_target"] = None
+        metrics[f"{prefix}rmsd_motif_error"] = f"{type(error).__name__}: {error}"
+    return metrics
+
+
+def _refold_metrics(
+    seq_id, stage, row, out_dir, root, binder, campaign, layout=None
+) -> dict:
     """The `{stage}_*` columns for one sequence.
 
     `pred_rows.jsonl` supplies what the kit measured; the rest is computed from
@@ -1230,6 +1468,9 @@ def _refold_metrics(seq_id, stage, row, out_dir, root, binder, campaign) -> dict
             metrics[f"{prefix}rmsd_to_design"] = None
             metrics[f"{prefix}rmsd_error"] = f"{type(error).__name__}: {error}"
 
+    if stage == "holo" and layout is not None:
+        metrics.update(_holo_ipsae(cifs[0], layout, binder, campaign))
+
     if stage == "holo":
         # Did binding change the fold? A binder whose apo and holo backbones
         # disagree was not folding into one shape, so its interface numbers
@@ -1238,11 +1479,16 @@ def _refold_metrics(seq_id, stage, row, out_dir, root, binder, campaign) -> dict
         apo_cifs = sorted((root / "apo" / seq_id).glob("*.cif")) if seq_id else []
         if apo_cifs:
             try:
-                from rfd3_pipeline.metrics.rmsd import superimpose_rmsd
+                # `rmsd_binder_apo_holo` rather than the superposition spelled
+                # out here: same calculation, and it additionally refuses a
+                # holo structure with no binder chain instead of returning a
+                # degenerate number.
+                from rfd3_pipeline.metrics.rmsd import rmsd_binder_apo_holo
 
                 apo = load_structure(apo_cifs[0])
-                apo_ca, holo_ca, _ = match_ca(apo, predicted, chains=[binder])
-                metrics["holo_rmsd_apo_holo"] = superimpose_rmsd(apo_ca, holo_ca)
+                metrics["holo_rmsd_apo_holo"] = rmsd_binder_apo_holo(
+                    predicted, apo, binder
+                )
             except Exception as error:
                 metrics["holo_rmsd_apo_holo"] = None
                 metrics["holo_rmsd_apo_holo_error"] = f"{type(error).__name__}: {error}"
@@ -1252,6 +1498,20 @@ def _refold_metrics(seq_id, stage, row, out_dir, root, binder, campaign) -> dict
     # The verdict is domain logic, not orchestration: it lives beside the gate
     # declarations it applies, where it can be tested without Modal.
     from rfd3_pipeline.gates import refold_verdict
+
+    # Placement, for the stage that has targets to align on. Apo folds the
+    # binder alone, so there is nothing to fit it against.
+    if stage == "holo" and design_path is not None and design_path.is_file():
+        metrics.update(
+            _target_aligned_rmsds(
+                load_structure(design_path),
+                predicted,
+                design_path.with_suffix("").with_suffix(".json"),
+                binder,
+                campaign.general.chain_targets,
+                prefix,
+            )
+        )
 
     metrics.update(refold_verdict(metrics, stage, campaign.refolding))
     return metrics
@@ -1411,7 +1671,7 @@ def _cv_fold_inputs(seq_ids, by_seq, campaign, resolved, alignments, ligands, in
     return prepared, skipped, seeds
 
 
-def _cv_metrics(seq_id, job_dir, root, binder, seeds) -> dict:
+def _cv_metrics(seq_id, job_dir, root, binder, seeds, campaign=None) -> dict:
     """The `cv_*` columns for one sequence.
 
     Reported across all seeds rather than from the best one alone. A single
@@ -1442,10 +1702,13 @@ def _cv_metrics(seq_id, job_dir, root, binder, seeds) -> dict:
         return metrics
 
     def spread(field: str) -> None:
+        # `_as_float` rather than `float()`, matching mpnn and refolding: a
+        # field that arrives as a string or a null costs one column here
+        # instead of raising and losing the sequence's whole record.
         values = [
-            float(payload[field])
-            for _, payload, _ in per_seed
-            if payload.get(field) is not None
+            value
+            for value in (_as_float(payload.get(field)) for _, payload, _ in per_seed)
+            if value is not None
         ]
         if not values:
             return
@@ -1469,11 +1732,72 @@ def _cv_metrics(seq_id, job_dir, root, binder, seeds) -> dict:
     if not cifs:
         metrics["cv_structure_error"] = "no model.cif for the best seed"
         return metrics
-    metrics.update(_cv_structure_metrics(cifs[0], seq_id, root, binder))
+    metrics.update(_cv_structure_metrics(cifs[0], seq_id, root, binder, campaign))
     return metrics
 
 
-def _cv_structure_metrics(cif, seq_id: str, root, binder: str) -> dict:
+def _cv_ipsae(cif, binder: str, campaign) -> dict:
+    """ipSAE for one cross-validation sample, from the fork's confidences.
+
+    Simpler than holo's: the fork writes `token_chain_ids` -- a chain id per
+    token, by name -- in the per-sample `*_confidences.json`, so there is no
+    index-to-chain mapping to get wrong and nothing to validate against the
+    submitted lengths.
+
+    Read from the container's scratch output rather than from the volume,
+    because `_af3_keep` deliberately does not retain this file: it holds the
+    full PAE and contact-probability matrices, which are large and are needed
+    only to compute these numbers once.
+
+    The same `ipsae.pae_cutoff` as holo, which is the point -- a
+    cross-validation score computed at a different cutoff would not be
+    comparable with the holo one it exists to check.
+    """
+    import json
+
+    import numpy as np
+
+    from rfd3_pipeline.metrics.ipsae import cross_chain_pae_floor, ipsae_from_tokens
+
+    confidences = [
+        path
+        for path in sorted(cif.parent.glob("*_confidences.json"))
+        if "summary" not in path.name
+    ]
+    if not confidences:
+        return {"cv_ipsae_error": f"no confidences.json in {cif.parent.name}"}
+
+    try:
+        payload = json.loads(confidences[0].read_text())
+        pae = np.asarray(payload["pae"], dtype=np.float32)
+        labels = [str(label) for label in payload["token_chain_ids"]]
+        proteins = [binder, *campaign.general.chain_targets]
+        scores = ipsae_from_tokens(
+            pae,
+            labels,
+            binder_chain=binder,
+            pae_cutoff=campaign.ipsae.pae_cutoff,
+            # Ligands excluded, as in holo. Named from the campaign here rather
+            # than from a layout, because the fork labels its tokens by chain
+            # id and the protein chains are exactly these.
+            keep=proteins,
+            # As holo: binder-centric, so the two stages' column sets match and
+            # neither grows quadratically in the number of targets.
+            pairs="binder",
+        )
+        scores.update(
+            cross_chain_pae_floor(
+                pae, labels, binder, list(campaign.general.chain_targets)
+            )
+        )
+    except Exception as error:
+        return {"cv_ipsae_error": f"{type(error).__name__}: {error}"}
+    return {f"cv_{name}": value for name, value in scores.items()}
+
+
+def _cv_structure_metrics(
+    cif, seq_id: str, root, binder: str, campaign=None
+) -> dict:
     """pLDDT and the comparison against holo, from one predicted structure.
 
     Model-independent: any cross-validation model produces a CIF and wants
@@ -1490,6 +1814,8 @@ def _cv_structure_metrics(cif, seq_id: str, root, binder: str) -> dict:
     from rfd3_pipeline.structure import ca_only, chain_subset, load_structure, match_ca
 
     metrics: dict[str, object] = {}
+    if campaign is not None:
+        metrics.update(_cv_ipsae(cif, binder, campaign))
     # pLDDT lives in the B-factor column, which biotite does not read unless
     # asked -- without `extra_fields` the attribute is absent entirely.
     predicted = load_structure(cif, extra_fields=["b_factor"])
@@ -1500,9 +1826,37 @@ def _cv_structure_metrics(cif, seq_id: str, root, binder: str) -> dict:
         metrics["cv_plddt_binder"] = None
         metrics["cv_plddt_error"] = f"{type(error).__name__}: {error}"
 
-    # The question the stage exists to answer: does an independent model put
-    # the binder where holo did? Agreement is corroboration; disagreement says
-    # holo's interface was one model's opinion.
+    # Did the independent model reproduce the *designed* backbone? This is the
+    # stronger of the two comparisons: agreeing with holo could mean both
+    # models share a bias, whereas the RFD3 design is the thing actually asked
+    # for. Completes the triple with `apo_rmsd_to_design` and
+    # `holo_rmsd_to_design`, which `_refold_metrics` already writes.
+    design_id = seq_id.rsplit("_seq", 1)[0] if "_seq" in seq_id else None
+    design = root / "rfd3" / "out" / f"{design_id}.cif.gz" if design_id else None
+    if design is not None and design.is_file():
+        try:
+            from rfd3_pipeline.metrics.rmsd import superimpose_rmsd
+
+            designed = load_structure(design)
+            design_ca, cv_ca, _ = match_ca(designed, predicted, chains=[binder])
+            metrics["cv_rmsd_to_design"] = superimpose_rmsd(design_ca, cv_ca)
+            if campaign is not None:
+                metrics.update(
+                    _target_aligned_rmsds(
+                        designed,
+                        predicted,
+                        design.with_suffix("").with_suffix(".json"),
+                        binder,
+                        campaign.general.chain_targets,
+                        "cv_",
+                    )
+                )
+        except Exception as error:
+            metrics["cv_rmsd_to_design"] = None
+            metrics["cv_rmsd_to_design_error"] = f"{type(error).__name__}: {error}"
+
+    # Do the two models agree with each other? Weaker than the above, but it is
+    # what says whether holo's interface was one model's opinion.
     holo_cifs = sorted((root / "holo" / seq_id).glob("*.cif"))
     if not holo_cifs:
         metrics["cv_rmsd_to_holo"] = None
@@ -1513,6 +1867,15 @@ def _cv_structure_metrics(cif, seq_id: str, root, binder: str) -> dict:
         holo = load_structure(holo_cifs[0])
         holo_ca, cv_ca, _ = match_ca(holo, predicted, chains=[binder])
         metrics["cv_rmsd_to_holo"] = superimpose_rmsd(holo_ca, cv_ca)
+        # Whether the two models dock the binder in the same place, as opposed
+        # to folding it the same way. The holo structure carries the targets,
+        # so this is the one comparison that can distinguish them.
+        if campaign is not None:
+            from rfd3_pipeline.metrics.rmsd import rmsd_binder_on_target
+
+            metrics["cv_rmsd_placement_vs_holo"] = rmsd_binder_on_target(
+                holo, predicted, binder, list(campaign.general.chain_targets)
+            )
     except Exception as error:
         metrics["cv_rmsd_to_holo"] = None
         metrics["cv_rmsd_error"] = f"{type(error).__name__}: {error}"
@@ -1532,6 +1895,7 @@ def _cv_write_records(
     metrics,
     keep,
     job_dir_of,
+    campaign=None,
 ) -> list[str]:
     """Write one shard per cross-validated sequence and keep its structure.
 
@@ -1562,7 +1926,7 @@ def _cv_write_records(
             for key, value in by_seq[seq_id].items()
             if not key.startswith(CV_SUPERSEDES)
         }
-        record.update(metrics(seq_id, job_dir, root, binder, seeds))
+        record.update(metrics(seq_id, job_dir, root, binder, seeds, campaign))
         record["stage_reached"] = Stage.CV
         write_shard(record, shards)
         written.append(seq_id)
@@ -1592,20 +1956,35 @@ def _af3_job_name(seq_id: str) -> str:
     return "".join(c for c in seq_id.replace(" ", "_") if c in allowed)
 
 
-def _af3_keep(record: dict) -> list[str]:
-    """The best seed's structure, and nothing else.
+def _af3_keep(record: dict, *, full_confidences: bool = False) -> list[str]:
+    """The best seed's structure, and nothing else by default.
 
     Five CIFs per sequence across a campaign is a lot of volume for a
     comparison already reduced to `cv_rmsd_to_holo`.
+
+    `full_confidences` also keeps the per-sample `*_confidences.json`, which
+    holds the whole token-by-token PAE and contact-probability matrices. That
+    is megabytes per sequence, so it is off at campaign scale -- but it is the
+    only way to interrogate a score after the fact, and a dry run exists to be
+    interrogated. `run.dry_run` turns it on for exactly that reason: the first
+    cross-validation ipSAE came back 0.0 and there was no way to tell a real
+    "no confident contact" from a mis-sliced matrix without the matrix.
+
+    Note the glob also matches `*_summary_confidences.json`, which is already
+    kept above; the duplicate copy is harmless and cheaper than a tighter
+    pattern.
     """
     best = record.get("cv_best_seed")
     if best is None:
         return []
-    return [
+    patterns = [
         f"seed-{best}_sample-*/*_model.cif",
         f"seed-{best}_sample-*/*_summary_confidences.json",
         "*_ranking_scores.csv",
     ]
+    if full_confidences:
+        patterns.append(f"seed-{best}_sample-*/*_confidences.json")
+    return patterns
 
 
 def _cross_validate_af3(seq_ids: list[str], campaign_payload: dict) -> dict:
@@ -1647,7 +2026,6 @@ def _cross_validate_af3(seq_ids: list[str], campaign_payload: dict) -> dict:
 
     from rfd3_pipeline.config import Weights
     from rfd3_pipeline.gpu import attention_tuning
-    from rfd3_pipeline.report import read_shards
     from rfd3_pipeline.spec import resolve_campaign
     from rfd3_pipeline.structure import load_structure
 
@@ -1669,11 +2047,7 @@ def _cross_validate_af3(seq_ids: list[str], campaign_payload: dict) -> dict:
     in_dir, out_dir = work / "in", work / "out"
     in_dir.mkdir(parents=True)
 
-    by_seq = {
-        record["seq_id"]: record
-        for record in read_shards(shards)
-        if record.get("seq_id") and record.get("sequence")
-    }
+    by_seq = _sequence_records(shards)
     resolved = resolve_campaign(campaign, structure_root=DATA)
 
     # Absolute paths on the volume, resolved once per container and shared by
@@ -1750,8 +2124,12 @@ def _cross_validate_af3(seq_ids: list[str], campaign_payload: dict) -> dict:
         binder=campaign.general.chain_binder,
         seeds=seeds,
         metrics=_cv_metrics,
-        keep=_af3_keep,
+        # Full matrices at smoke scale only -- see `_af3_keep`.
+        keep=lambda record: _af3_keep(
+            record, full_confidences=campaign.run.dry_run
+        ),
         job_dir_of=lambda out, seq_id: out / _af3_job_name(seq_id),
+        campaign=campaign,
     )
 
     data_volume.commit()
@@ -1913,6 +2291,10 @@ def reduce_summaries(campaign_payload: dict) -> dict:
             "n_mpnn_seqs_per_design": campaign.mpnn.num_seqs,
             "max_sequences": rfd3.total_designs * campaign.mpnn.num_seqs,
             "n_cv_seeds": campaign.cross_validation.num_seeds,
+            # Recorded beside the scores, because ipSAE at one cutoff is not
+            # comparable with ipSAE at another and every other implementation
+            # defaults to 15.
+            "ipsae_pae_cutoff": campaign.ipsae.pae_cutoff,
         },
     )
     data_volume.commit()

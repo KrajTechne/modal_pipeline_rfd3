@@ -160,7 +160,14 @@ msa:
   auth_header: null
 
 ipsae:
-  pae_cutoff: 10                 # explicit: the helper defaults to 15
+  # One cutoff for holo and cross-validation alike: scores at different
+  # cutoffs are not comparable, and comparing them is the point of the stage.
+  # Stricter than the reference implementations' 15, stated explicitly because
+  # an unstated 10 would be silently ignored. Expect `cv_ipsae_*` of 0.0 here:
+  # OpenFold3's closest binder-target PAE is 10.6-12.8, so nothing qualifies.
+  # `pae_floor_<target>` in the summary is what makes that readable.
+  pae_cutoff: 10
+  # Not consumed: the in-process ipSAE is PAE-only. Recorded for the day it is.
   dist_cutoff: 10
 
 run:

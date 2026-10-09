@@ -661,9 +661,32 @@ class MsaConfig(_Base):
 
 
 class IpsaeConfig(_Base):
-    # Explicit because every existing implementation defaults to 15.
     pae_cutoff: float = 10.0
+    """Read by `metrics.ipsae`, and applied to holo and cross-validation alike
+    -- scores computed at different cutoffs would not be comparable, which is
+    the whole point of cross-validating.
+
+    **10, stricter than the reference implementations' 15** (which is why the
+    plan recorded it explicitly: an unstated 10 would have been silently
+    ignored). Briefly set to 15 on 2026-10-09 and reverted the same day.
+
+    It is not a free parameter, and the measured consequence is worth knowing
+    before anyone changes it again. ipSAE counts only residue pairs below this
+    PAE, so a complex whose closest cross-chain confidence sits above it scores
+    exactly **0**. Cross-validation does: OpenFold3's closest binder-target
+    PAE on this campaign is 10.6 to 12.8, so `cv_ipsae_*` reads 0.0 at a cutoff
+    of 10 and barely above it at 15. That is a real finding -- the independent
+    model reproduces the binder's fold and is not confident about the interface
+    -- rather than a miscalibration. `pae_floor_<target>` is recorded beside
+    every score so a zero is readable rather than mysterious."""
+
     dist_cutoff: float = 10.0
+    """**Not consumed yet.** `metrics/ipsae.py` is PAE-only; the Dunbrack
+    reference CLI additionally takes a distance cutoff, and this records the
+    value to use if the pipeline ever calls it or grows a distance-aware
+    implementation. Kept rather than deleted so the intended value is not lost,
+    but tuning it today changes nothing -- which is worth knowing before
+    treating it as a knob."""
 
 
 class RunConfig(_Base):

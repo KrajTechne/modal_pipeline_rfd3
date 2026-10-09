@@ -16,7 +16,7 @@ import json
 from collections.abc import Iterable, Mapping, Sequence
 from pathlib import Path
 
-from .gates import Stage
+from .gates import Stage, metric_rules
 
 __all__ = [
     "build_summary_csv",
@@ -159,14 +159,17 @@ def _funnel(
     passed = [r for r in reached if r.get(f"{prefix}pass") is True]
     counts["n_pass"] = tally(passed)
     counts["n_fail"] = counts["n_in"] - counts["n_pass"]
+    # `metric_rules` renders the rule strings and the failure counts are
+    # joined onto them, so `"<= 0.5"` is spelled in one place rather than two
+    # that could drift.
     counts["metrics"] = {
-        gate.metric: {
-            "rule": gate.rule,
+        metric: {
+            "rule": rule,
             "n_fail": tally(
-                [r for r in reached if r.get(f"{prefix}{gate.metric}_pass") is False]
+                [r for r in reached if r.get(f"{prefix}{metric}_pass") is False]
             ),
         }
-        for gate in gates
+        for metric, rule in metric_rules(gates).items()
     }
     return counts
 

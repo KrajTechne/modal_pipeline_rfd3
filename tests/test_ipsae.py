@@ -124,3 +124,32 @@ class TestIpsaeFromPae:
         out = ipsae_from_pae(pae, ["A", "B"], [5, 25], binder_chain="A")
         assert out["ipsae_A_B"] == pytest.approx(1.0)
         assert out["ipsae_B_A"] == 0.0
+
+
+class TestTheVectorisedD0MatchesItsReference:
+    """`d0_from_n0` calls itself "the scalar reference the tests pin" and
+    `_d0_array` is what the hot path actually runs. Nothing compared them, so
+    the two could have drifted with every test still passing -- the scalar one
+    is not on any code path."""
+
+    def test_they_agree_across_the_range(self):
+        import numpy as np
+
+        from rfd3_pipeline.metrics.ipsae import _d0_array, d0_from_n0
+
+        n0 = np.arange(0, 400)
+        vectorised = _d0_array(n0).ravel()
+        scalar = np.array([d0_from_n0(int(n)) for n in n0])
+        assert vectorised == pytest.approx(scalar)
+
+    def test_they_agree_at_the_continuity_point(self):
+        """n0 = 27 is where the expression crosses the 1.0 floor, so it is
+        where a floor applied differently in the two forms would show."""
+        import numpy as np
+
+        from rfd3_pipeline.metrics.ipsae import _d0_array, d0_from_n0
+
+        for n in (25, 26, 27, 28):
+            assert _d0_array(np.array([n])).ravel()[0] == pytest.approx(
+                d0_from_n0(n)
+            )

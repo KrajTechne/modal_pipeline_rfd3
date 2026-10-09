@@ -30,7 +30,13 @@ from collections.abc import Sequence
 
 import numpy as np
 
-__all__ = ["ipsae_from_pae", "directional_ipsae", "d0_from_n0"]
+__all__ = [
+    "ipsae_from_pae",
+    "ipsae_from_tokens",
+    "cross_chain_pae_floor",
+    "directional_ipsae",
+    "d0_from_n0",
+]
 
 # Below this many passing residues the d0 expression falls under 1.0; the score
 # uses 1.0 there so d0 never shrinks toward zero and inflates the ratio.
@@ -98,8 +104,9 @@ def ipsae_from_pae(
     *,
     pae_cutoff: float = 10.0,
     binder_chain: str | None = None,
+    pairs: str = "all",
 ) -> dict[str, float]:
-    """ipSAE for every chain pair, plus the binder-centric summaries.
+    """ipSAE per chain pair, plus the binder-centric summaries.
 
     Args:
         pae: square (L, L) PAE matrix, residues in the same order as
@@ -113,10 +120,27 @@ def ipsae_from_pae(
             default to 15, which is why it is never left implicit here.
         binder_chain: when given, the returned dict adds `ipsae_min_<target>`
             for each other chain, plus `ipsae_min` and `max_ipsae_min`.
+        pairs: `"all"` for every ordered chain pair, or `"binder"` for only
+            those involving `binder_chain`. The pipeline passes `"binder"`:
+            the ordered pairs grow as (N+1)N in the number of targets, and the
+            target-to-target ones never involve the designed chain. At two
+            targets that is 10 columns against 7; at five it is 37 against 17,
+            doubled again because holo and cross-validation both write them.
+            Target-to-target scores are still worth having for a one-off sanity
+            check -- on this campaign the native pair reads 0.88/0.86 where the
+            designed interface reads 0.61 -- which is why `"all"` remains
+            available rather than being removed.
 
     Returns:
-        `ipsae_<aligned>_<measured>` for every ordered pair, plus the
-        binder-centric keys when `binder_chain` is set.
+        `ipsae_<aligned>_<measured>` per ordered pair, plus the binder-centric
+        keys when `binder_chain` is set:
+
+        * `ipsae_min_<target>` -- the lower of the two directions for that
+          target, since the score is asymmetric and the weaker direction is the
+          honest one.
+        * `ipsae_min` -- the lowest of those, i.e. the binder's worst interface.
+        * `max_ipsae_min` -- the best of them, reported only when there is more
+          than one target and so something to choose between.
     """
     pae = np.asarray(pae)
 
@@ -146,6 +170,10 @@ def ipsae_from_pae(
         raise ValueError(
             f"binder_chain {binder_chain!r} not among chains {list(chain_ids)}"
         )
+    if pairs not in ("all", "binder"):
+        raise ValueError(f"pairs must be 'all' or 'binder', got {pairs!r}")
+    if pairs == "binder" and binder_chain is None:
+        raise ValueError("pairs='binder' needs binder_chain to say which it is")
 
     blocks: dict[str, slice] = {}
     start = 0
@@ -156,6 +184,8 @@ def ipsae_from_pae(
     results: dict[str, float] = {}
     for i, first in enumerate(chain_ids):
         for second in list(chain_ids)[i + 1 :]:
+            if pairs == "binder" and binder_chain not in (first, second):
+                continue
             results[f"ipsae_{first}_{second}"] = directional_ipsae(
                 pae, blocks[first], blocks[second], pae_cutoff
             )
@@ -186,3 +216,125 @@ def ipsae_from_pae(
             results["max_ipsae_min"] = max(values)
 
     return results
+
+
+def ipsae_from_tokens(
+    pae: np.ndarray,
+    token_chains: Sequence[str],
+    *,
+    binder_chain: str | None = None,
+    pae_cutoff: float = 10.0,
+    keep: Sequence[str] | None = None,
+    pairs: str = "all",
+) -> dict[str, float]:
+    """ipSAE from a PAE plus one chain label per token.
+
+    The shared entry point for both folding stages, because both models report
+    per-token chain membership rather than chain lengths: ESMFold2 writes
+    `asym_id` beside the PAE in its `*_pae.npz`, and the AF3 fork writes
+    `token_chain_ids` in its per-sample confidences JSON. Deriving the blocks
+    here means neither caller has to count residues and risk disagreeing with
+    the matrix it is slicing.
+
+    `keep` restricts the calculation to those chains, which is how ligands are
+    excluded. A metal ion is a single token, and a one-residue "chain" produces
+    a defined but meaningless ipSAE that would then be folded into `ipsae_min`
+    as though it were a target. Passing the campaign's protein chains is both
+    correct and self-documenting.
+
+    Raises:
+        ValueError: if the labels do not match the matrix, or if any chain's
+            tokens are not contiguous. Non-contiguous tokens would make the
+            slices in `ipsae_from_pae` describe the wrong residues while
+            returning entirely plausible numbers -- the same class of silent
+            error its own total check guards against.
+    """
+    pae = np.asarray(pae)
+    labels = [str(label) for label in token_chains]
+
+    if pae.ndim != 2 or pae.shape[0] != pae.shape[1]:
+        raise ValueError(f"PAE must be square and 2-D, got shape {pae.shape}")
+    if len(labels) != pae.shape[0]:
+        raise ValueError(
+            f"{len(labels)} token labels but PAE is "
+            f"{pae.shape[0]}x{pae.shape[0]}; refusing to guess the alignment"
+        )
+
+    # Contiguous runs, in the order they appear.
+    runs: list[tuple[str, int, int]] = []
+    for index, label in enumerate(labels):
+        if runs and runs[-1][0] == label:
+            runs[-1] = (label, runs[-1][1], index + 1)
+        else:
+            runs.append((label, index, index + 1))
+
+    seen: set[str] = set()
+    for label, _, _ in runs:
+        if label in seen:
+            raise ValueError(
+                f"chain {label!r} appears in more than one block of tokens "
+                f"({[r[0] for r in runs]}); every chain must be contiguous for "
+                "its PAE slice to describe it"
+            )
+        seen.add(label)
+
+    if keep is not None:
+        wanted = list(keep)
+        missing = [chain for chain in wanted if chain not in seen]
+        if missing:
+            raise ValueError(
+                f"chain(s) {missing} are not among the tokens "
+                f"({sorted(seen)}); the prediction does not hold them"
+            )
+        runs = [run for run in runs if run[0] in wanted]
+        index = np.concatenate([np.arange(start, stop) for _, start, stop in runs])
+        pae = pae[np.ix_(index, index)]
+
+    return ipsae_from_pae(
+        pae,
+        [label for label, _, _ in runs],
+        [stop - start for _, start, stop in runs],
+        pae_cutoff=pae_cutoff,
+        binder_chain=binder_chain,
+        pairs=pairs,
+    )
+
+
+def cross_chain_pae_floor(
+    pae: np.ndarray,
+    token_chains: Sequence[str],
+    binder_chain: str,
+    targets: Sequence[str],
+) -> dict[str, float]:
+    """The lowest PAE between the binder and each target.
+
+    Diagnostic, and it exists because ipSAE can be legitimately **0.0** and
+    that is indistinguishable from a broken extraction. The score counts only
+    residue pairs under `pae_cutoff`; if none qualify, every residue scores
+    zero and so does the maximum over them. Recording the floor says which
+    happened: a floor above the cutoff means the model placed no confident
+    contact, while a floor well under it alongside a zero score would mean the
+    blocks were mis-sliced.
+
+    Returns `pae_floor_<target>` per target, in the PAE's own units.
+    """
+    pae = np.asarray(pae, dtype=np.float32)
+    labels = np.asarray([str(label) for label in token_chains])
+    if len(labels) != pae.shape[0]:
+        raise ValueError(
+            f"{len(labels)} token labels but PAE is {pae.shape[0]}x{pae.shape[0]}"
+        )
+
+    binder = labels == binder_chain
+    if not binder.any():
+        raise ValueError(f"binder chain {binder_chain!r} is not among the tokens")
+
+    floors: dict[str, float] = {}
+    for target in targets:
+        mask = labels == target
+        if not mask.any():
+            continue
+        block = pae[np.ix_(binder, mask)]
+        other = pae[np.ix_(mask, binder)]
+        floors[f"pae_floor_{target}"] = float(min(block.min(), other.min()))
+    return floors
