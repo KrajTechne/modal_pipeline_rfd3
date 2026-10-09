@@ -1145,6 +1145,43 @@ sequence(s)"* -- exactly the two targets. The binder's single-sequence stub kept
 it out, which is the mechanism that keeps a de novo sequence off the network,
 and `""` would have done the same. Absent is the one state that fetches.
 
+### Every RMSD column measures fold, not placement
+
+[corrected 2026-10-09] `apo_rmsd_to_design`, `holo_rmsd_to_design`,
+`holo_rmsd_apo_holo` and `cv_rmsd_to_holo` all pair
+`match_ca(..., chains=[binder])` with a maskless `superimpose_rmsd`. That fits
+on the binder and measures the binder: translation and rotation are fitted
+away, and the targets are excluded before fitting. **A binder that folds
+identically and docks somewhere else scores near zero.**
+
+`metrics/rmsd.py` had the other measurement all along -- `target_superposition`
+("what makes binder displacement visible instead of being absorbed into the
+fit"), `rmsd_binder_on_target` and `rmsd_motif_on_target` -- and none of the
+three was called. They are wired now as `{stage}_rmsd_binder_on_target` and
+`{stage}_rmsd_motif_on_target`, added rather than substituted, because the fold
+columns are what the holo gate consumes.
+
+Apo gets neither: it folds the binder alone, so there is nothing to align
+against. That is a property of the stage, not an omission.
+
+The first numbers are uncomfortable, and are the reason this distinction is
+worth writing down:
+
+| seq_id | stage | fold | placement | motif | ipSAE |
+|---|---|---|---|---|---|
+| model_1_seq1 | holo | 0.77 | 3.77 | 0.83 | 0.598 |
+| model_1_seq1 | cv | 1.85 | 7.78 | 9.65 | 0.000 |
+| model_1_seq2 | holo | 1.11 | **20.98** | 7.24 | 0.012 |
+| model_2_seq2 | holo | 3.52 | 4.90 | **0.76** | 0.540 |
+
+`model_1_seq2` **passed** the holo gate with its binder 21 A from where it was
+designed, because the gate tests fold change and ipTM and it reads healthy by
+both. `model_2_seq2` was **rejected** while placing the motif to 0.76 A with
+ipSAE 0.54. Four sequences at dry-run scale is a signal rather than a
+conclusion, but it says the gate may be poorly aligned with the design
+objective, and nothing could see it until these columns existed. Settle it
+before a full campaign.
+
 ### The holo gate
 
 [added 2026-10-09] Holo now writes `holo_pass`, which is what cross-validation
