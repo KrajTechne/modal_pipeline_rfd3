@@ -1305,6 +1305,53 @@ Read the zeros as a verdict, not as missing data. `pae_floor_B`/`pae_floor_C`
 are recorded next to them for exactly this -- they say how far outside the
 cutoff the best pair fell, so a 0.0 can be told apart from a 0.0.
 
+**There is no cliff at the cutoff.** Of the 72 `cv_ipsae_min_B` zeros in
+`alphav_beta3_02`, 58 have a PAE floor at or above 10 and so score 0 by
+construction -- no pair qualifies, nothing to average. The other 14 have floors
+of 7.3 to 9.9, where one or two pairs scrape under, and come out like
+`A->B 0.000 / B->A 0.011`; `ipsae_min` takes the min of the two directions and
+reports 0. Those 14 are not a separate population from the 0.010-0.013 crowd.
+Values run continuously 0.000 -> 0.010 -> 0.013, and every one of them means
+the same thing: no confident interface. Do not treat an exact 0.0 as a distinct
+failure mode.
+
+### At holo, ipSAE at cutoff 10 tracks placement; at CV it does not
+
+`alphav_beta3_02`, bucketed on `rmsd_binder_on_target`. `zeros` is how many of
+that bucket's `n` scored *exactly* 0.0, printed beside the median because a
+median of 0.000 hides whether it was half the bucket or all of it.
+
+```
+holo (n=292)                       cv (n=138)
+placement     n  zeros    med      placement     n  zeros    med     max
+< 5 A       154      2  0.513      < 5 A        40      8  0.191   0.580
+5-15 A       52     17  0.048      5-15 A       32     22  0.000   0.364
+> 15 A       86     45  0.000      > 15 A       66     49  0.000   0.435
+```
+
+Holo is the clean half. Across the 138 sequences that passed the holo gate
+there is **not one zero** and the median is 0.532; across the 154 that failed,
+64 are zero and the median is 0.013. So at cutoff 10 holo ipSAE is close to a
+proxy for placement -- which is the case for keeping the metric, because it
+corroborates the placement RMSD gate from the PAE matrix instead of restating
+ipTM (see "`threshold_ipTM` does no independent work").
+
+CV is the degraded half, and the `max` column is why. Sequences the CV model
+placed *more than 15 A* from the target still reach 0.435, above the median of
+CV's own best bucket. The ordering survives; the separation does not.
+OpenFold3's binder-target PAE floor medians 8.8 A against holo's 1.09, so half
+the distribution sits the wrong side of the cutoff and the metric spends its
+range on structures it cannot distinguish.
+
+**Which is the measured reason ipSAE informs CV ranking and never gates it.**
+Of the 16 sequences where both models agree on placement (<= 5 A) *and* motif
+(<= 2 A), **two score `cv_ipsae_min` of exactly 0.000** --
+`rgd_core_4_model_2_seq8` at 2.04 A placement and `rgd_core_4_model_5_seq4` at
+4.22 A. A CV ipSAE gate would have discarded 12% of the campaign's best
+designs. The holo result stands on n=292; the CV conclusions are directional,
+resting on 138 sequences whose 16 survivors collapse into 9 distinct designs,
+7 of them from `rgd_core_2_model_0` and `_model_1` alone.
+
 (`ipsae.dist_cutoff` remains unconsumed; see section 7.)
 
 ### Apo records no ipTM
