@@ -1285,6 +1285,36 @@ are placed.
 The two module rules in section 3 are the whole of it, and both were learned the
 expensive way. The module docstring (`app.py:10-19`) states them.
 
+### A helper does not inherit the caller's function-local imports
+
+[cost a campaign, 2026-10-12] `app.py` keeps every import inside a function
+body, for the reason its module docstring gives: a stray top-level import
+crashes every container before any function body runs. The trap is that a
+*module-level helper* called from such a function cannot see those imports.
+
+`_check_hotspot_numbering` used `renumber_hotspots_for_design`, which was
+imported inside `filter_designs`. It raised `NameError` on **all 80 designs**
+of the first full campaign. `filter_designs` catches per design so one bad
+design cannot lose the chunk, so the run continued, wrote no shards, skipped
+every later phase for want of passing designs, and produced a `summary.json`
+of zeros with the reason nowhere in it.
+
+Three things made it survive review:
+
+* It is not a typo. The name is spelled right and imported -- just one scope
+  away.
+* **Local testing cannot reproduce it.** A test script imports at module scope,
+  so calling the helper directly works. It only fails through the caller.
+* The pipeline degraded quietly instead of failing. Every stage after it had
+  nothing to do, which is indistinguishable from a campaign where nothing
+  passed the filters.
+
+So: when a function body imports something, check whether the *helpers it
+calls* use that name too, and give each its own import. And when a stage can
+swallow per-item failures, there must be a way to read the reasons --
+`filter_only` exists because the filters had none, and finding this took a
+new entrypoint rather than a log.
+
 ### A container is reused, so a fixed scratch path is a bug
 
 [found 2026-10-09, in review, before it ever ran at scale] Modal runs several

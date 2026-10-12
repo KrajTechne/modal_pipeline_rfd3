@@ -680,7 +680,6 @@ def filter_designs(design_ids: list[str], campaign_payload: dict) -> dict:
     from rfd3_pipeline.spec import (
         assert_output_chains,
         load_design_metadata,
-        renumber_hotspots_for_design,
         resolve_campaign,
     )
     from rfd3_pipeline.structure import load_structure
@@ -757,6 +756,13 @@ def _check_hotspot_numbering(metadata, spec, structure, binder: str) -> None:
     verdict is wrong. `filter_designs` catches per design, so this fails one
     design loudly instead of losing the chunk.
     """
+    # Its own import. `app.py` keeps imports inside function bodies, and a
+    # helper called from such a function does **not** inherit them -- this read
+    # `renumber_hotspots_for_design` from `filter_designs`'s namespace and
+    # raised `NameError` on all 80 designs of the first full campaign. Local
+    # testing missed it because a test script imports at module scope.
+    from rfd3_pipeline.spec import renumber_hotspots_for_design
+
     declared = spec.hotspots_by_output_chain()
     if not declared:
         return
@@ -2687,6 +2693,7 @@ def run(
     start_at: str = "rfd3",
     chunk_size: int = 32,
     dry_run: bool = False,
+    spawn: bool = False,
 ):
     """Run a campaign.
 
@@ -2694,8 +2701,31 @@ def run(
     cross-validation seed -- and renames the run so its output lands in a
     separate directory. A campaign that mysteriously produced two designs is
     almost always this flag, which is why the rename and the banner exist.
+
+    `--spawn` hands the orchestrator to the server and returns immediately,
+    which is the only form that survives this client exiting. **`--detach` is
+    not enough**, learned the expensive way on 2026-10-09: a campaign launched
+    with `modal run --detach` produced all 80 RFD3 designs and then stopped
+    dead before the filters, because detached mode keeps only the *last
+    triggered* call alive -- and by the time the client died that was
+    `run_rfd3`, spawned by the orchestrator rather than by this entrypoint. The
+    children outlived the parent. A spawned call is owned by the server and has
+    no parent to lose.
+
+    Use `--spawn` for anything long, then follow it with `reduce_only` or by
+    reading `summary.json` off the volume. Without it this blocks and streams,
+    which is what you want for a dry run.
     """
     payload, _, _ = _prepare(campaign, dry_run=dry_run)
+    if spawn:
+        call = orchestrate.spawn(payload, start_at=start_at, chunk_size=chunk_size)
+        print(
+            f"\nspawned orchestrator, call id {call.object_id}\n"
+            f"  it runs server-side and does not need this client.\n"
+            f"  results land in summary.json / summary.csv under the run "
+            f"directory; `reduce_only` rebuilds them from the shards.\n"
+        )
+        return
     report = orchestrate.remote(payload, start_at=start_at, chunk_size=chunk_size)
     _show(report)
 
@@ -2848,6 +2878,48 @@ def cache_msas(campaign: str, dry_run: bool = False, force: bool = False):
     """
     payload, _, _ = _prepare(campaign, dry_run=dry_run)
     _show(build_msa_cache.remote(payload, force=force))
+
+
+@app.local_entrypoint()
+def filter_only(campaign: str, dry_run: bool = False, limit: int = 0):
+    """Run the backbone filters over the designs already on the volume.
+
+    Exists because the filters are the one stage with no way to see their own
+    failures: `filter_designs` catches per design so a bad one cannot lose the
+    chunk, and returns the reasons in its report -- which goes to whoever
+    called it. Under `--spawn` that is the server, so a campaign where every
+    design failed the filters produced a summary of zeros and no explanation
+    anywhere. This is how to get the explanation, in seconds, on CPU.
+
+    `--limit N` filters only the first N designs, which is enough to see why.
+    """
+    payload, _, _ = _prepare(campaign, dry_run=dry_run)
+    _show(_filter_one_pass.remote(payload, limit=limit))
+
+
+@app.function(image=cpu_image, volumes=VOLUMES, timeout=HOUR)
+def _filter_one_pass(campaign_payload: dict, limit: int = 0) -> dict:
+    """Pick the designs and filter them, reporting every failure reason."""
+    data_volume.reload()
+
+    campaign = _campaign_from(campaign_payload)
+    root = Path(_run_root(campaign))
+    out_dir = root / "rfd3" / "out"
+    designs = sorted(p.name[: -len(".cif.gz")] for p in out_dir.glob("*.cif.gz"))
+    if limit:
+        designs = designs[:limit]
+    if not designs:
+        return {"n_designs": 0, "note": f"no designs under {out_dir}"}
+
+    result = filter_designs.local(designs, campaign_payload)
+    # The reasons are the point, so they are surfaced rather than counted.
+    failures = result.get("failures", [])
+    return {
+        "n_designs": len(designs),
+        "n_written": result.get("n_written"),
+        "n_failed": len(failures),
+        "first_failures": failures[:5],
+    }
 
 
 @app.local_entrypoint()
