@@ -723,6 +723,12 @@ class IpsaeConfig(_Base):
     plan recorded it explicitly: an unstated 10 would have been silently
     ignored). Briefly set to 15 on 2026-10-09 and reverted the same day.
 
+    **The reason not to raise it is external to this codebase.** The published
+    post-hoc analyses correlating ipSAE with binder success in the lab use 10,
+    and that correlation is the only reason to prefer ipSAE over ipTM here.
+    Tuning the cutoff to spread our own distribution out would decouple the
+    score from the evidence that justifies computing it. Settled 2026-10-12.
+
     It is not a free parameter, and the measured consequence is worth knowing
     before anyone changes it again. ipSAE counts only residue pairs below this
     PAE, so a complex whose closest cross-chain confidence sits above it scores

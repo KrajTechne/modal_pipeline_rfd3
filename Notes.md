@@ -1182,8 +1182,7 @@ gate's verdict in the last column:
 | model_2_seq2 | holo | 3.52 | 4.90 | **0.76** | 0.888 | 0.540 | fail |
 
 Cross-validation also reports `cv_rmsd_placement_vs_holo`: 5.26 for seq1 and
-11.84 for seq2. `apo_iptm` reads 0.000 because apo folds one chain -- expected,
-not a fault.
+11.84 for seq2. Apo no longer records an ipTM at all -- see below.
 
 Four things follow, and the ipTM column is what makes the first one visible.
 
@@ -1277,6 +1276,36 @@ cross-validation could handle.
 Expect `UFFTYPER: Unrecognized atom type: Mn2+2` from RDKit on every
 featurisation. It is noise, not a failure -- the fold completes and the metals
 are placed.
+
+### `ipsae.pae_cutoff` stays at 10, and the zeros are the point
+
+At campaign scale a large minority of ipSAE values come out *exactly* 0.0 --
+64/292 holo rows and 31/64 cross-validation rows in `alphav_beta3_02`, with a
+cross-validation median of 0.010. A cutoff of 10 A on PAE admits no residue
+pair at all for those structures, so the score has nothing to average.
+
+That looks like a degenerate metric and the obvious reaction is to raise the
+cutoff until the distribution spreads out. **Do not.** 10 A is the value used
+by the published post-hoc analyses that correlate ipSAE with binder success in
+the lab, which is the only reason to prefer ipSAE over ipTM in the first place.
+Moving the cutoff to make our own histogram prettier would decouple the number
+from the evidence that justifies computing it, and a value of 0.0 is a real
+answer: no pair of residues across that interface is confidently placed.
+
+Read the zeros as a verdict, not as missing data. `pae_floor_B`/`pae_floor_C`
+are recorded next to them for exactly this -- they say how far outside the
+cutoff the best pair fell, so a 0.0 can be told apart from a 0.0.
+
+(`ipsae.dist_cutoff` remains unconsumed; see section 7.)
+
+### Apo records no ipTM
+
+ipTM scores an interface and apo folds the binder alone, so the kit returned
+0.000 for all 560 apo rows of the first full campaign -- a number that reads as
+a catastrophic interface in any table rather than as "not applicable".
+`_refold_metrics` now omits the key for apo, and since the CSV's columns are
+derived from the keys actually present, the column disappears with it. `ptm` is
+kept: it is a monomer score and means something for a lone binder.
 
 ---
 

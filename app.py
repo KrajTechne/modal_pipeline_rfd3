@@ -1430,13 +1430,18 @@ def _refold_metrics(
     metrics: dict[str, object] = {
         f"{prefix}status": (row or {}).get("status"),
         f"{prefix}ptm": _as_float((row or {}).get("ptm")),
-        f"{prefix}iptm": _as_float((row or {}).get("iptm")),
         f"{prefix}n_tokens": _as_int((row or {}).get("n_tokens")),
         f"{prefix}wall_s": _as_float((row or {}).get("wall_s")),
         # Positive evidence about the MSA rather than trust in the flag: 0 means
         # the fold genuinely saw no alignment.
         f"{prefix}msa_depth": max((row or {}).get("msa_depths") or [0]),
     }
+
+    # ipTM scores an *interface*. Apo folds the binder alone, so the kit reports
+    # 0.000 for want of a second chain -- a number that reads as a catastrophic
+    # score in any table rather than as "not applicable". Only holo gets it.
+    if stage != "apo":
+        metrics[f"{prefix}iptm"] = _as_float((row or {}).get("iptm"))
 
     cifs = sorted((out_dir / "cif_all").glob(f"{seq_id}__*.cif"))
     if not cifs:
