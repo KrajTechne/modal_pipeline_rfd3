@@ -47,6 +47,23 @@ METRICS = [
 STAGES = ["apo", "holo", "cv"]
 
 
+def column_for(rows, stage, suffix):
+    """`{stage}_{suffix}`, or the `_mean` aggregate when that is what exists.
+
+    Cross-validation folds several seeds and reports `cv_iptm_mean/_best/_worst`
+    rather than a bare `cv_iptm`, so a straight `{stage}_{suffix}` lookup left
+    CV's ipTM out of the distributions entirely -- the one column these tables
+    were extended to show.
+    """
+    direct = f"{stage}_{suffix}"
+    if any(direct in row for row in rows[:1]):
+        return direct, ""
+    averaged = f"{direct}_mean"
+    if any(averaged in row for row in rows[:1]):
+        return averaged, " (mean)"
+    return direct, ""
+
+
 def numbers(rows, column):
     out = []
     for row in rows:
@@ -81,9 +98,11 @@ def distributions(rows):
     for stage in STAGES:
         shown = False
         for suffix, label in METRICS:
-            values = numbers(rows, f"{stage}_{suffix}")
+            column, qualifier = column_for(rows, stage, suffix)
+            values = numbers(rows, column)
             if not values:
                 continue
+            label = f"{label}{qualifier}"
             if not shown:
                 print()
                 print(head)

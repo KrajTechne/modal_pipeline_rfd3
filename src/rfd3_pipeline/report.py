@@ -261,9 +261,13 @@ def build_summary_json(
             "designs" if stage == Stage.BACKBONE_FILTERS else "sequences",
         )
 
-    # Where each design came to rest. Unlike the per-stage counts above this is
-    # keyed on equality, because that is the question it answers.
-    counts["survivors"] = {
+    # Where each record came to rest. Unlike the per-stage counts above this is
+    # keyed on equality, because that is the question it answers -- so for every
+    # stage but the last these are the *casualties*, not the survivors. It was
+    # called `survivors` until 2026-10-12, when the first full campaign printed
+    # `{"apo": 268}` beside an apo stage that had passed 292 of 560: read as
+    # survivors it inverted the result it was reporting.
+    counts["stage_reached"] = {
         stage: sum(1 for r in records if r.get("stage_reached") == stage)
         for stage in Stage.ORDER
         if any(r.get("stage_reached") == stage for r in records)

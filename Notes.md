@@ -1277,6 +1277,15 @@ Expect `UFFTYPER: Unrecognized atom type: Mn2+2` from RDKit on every
 featurisation. It is noise, not a failure -- the fold completes and the metals
 are placed.
 
+### `summary.json` counts where records came to rest, not who lived
+
+The block is `stage_reached`. It was called `survivors` until the first full
+campaign printed `{"apo": 268}` beside an apo stage that had passed **292 of
+560** -- those 268 are the sequences that *died* at apo. It is keyed on
+`stage_reached == stage`, so for every stage but the last it counts casualties,
+and the old name inverted the result it was reporting. The per-stage
+`n_pass`/`n_fail` in `steps` are the numbers to read for pass rates.
+
 ### `ipsae.pae_cutoff` stays at 10, and the zeros are the point
 
 At campaign scale a large minority of ipSAE values come out *exactly* 0.0 --

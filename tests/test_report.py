@@ -136,11 +136,17 @@ class TestSummaryJson:
             GATES[1].rule
         )
 
-    def test_survivors_follow_stage_order(self):
+    def test_stage_reached_follows_stage_order(self):
+        """Named for what it counts: where records came to rest, not who lived.
+
+        Called `survivors` until 2026-10-12, when a real campaign reported
+        `{"apo": 268}` next to an apo stage that passed 292 of 560.
+        """
         summary = build_summary_json(
             [record("d1")], "tpo", "tpo_01", 1, {Stage.BACKBONE_FILTERS: GATES}
         )
-        assert list(summary["survivors"]) == [Stage.BACKBONE_FILTERS]
+        assert list(summary["stage_reached"]) == [Stage.BACKBONE_FILTERS]
+        assert "survivors" not in summary
 
     def test_campaign_identity(self):
         summary = build_summary_json(
