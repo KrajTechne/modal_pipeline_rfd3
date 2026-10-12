@@ -46,8 +46,10 @@ METRICS = (
 )
 
 # Where a campaign's artifacts turn up, most specific first: inside a pipeline
-# container, in a Modal notebook with the volume attached, then a local copy.
-_VOLUME_ROOTS = ("/data", "/mnt/rfd3-pipeline", ".")
+# container, in a Modal notebook with the volume attached, then a local pull
+# (`structures/` is gitignored and is where `modal volume get` output goes),
+# then the working directory.
+_VOLUME_ROOTS = ("/data", "/mnt/rfd3-pipeline", "structures", ".")
 
 
 def find_run(campaign: str, run: str, roots: Iterable[str] = _VOLUME_ROOTS) -> Path:

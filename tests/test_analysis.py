@@ -183,6 +183,13 @@ class TestFindRun:
         with pytest.raises(FileNotFoundError, match="summary.csv"):
             analysis.find_run("camp", "run", roots=(str(tmp_path),))
 
+    def test_a_local_pull_under_structures_is_found(self):
+        """`modal volume get` output lands there, and it is gitignored."""
+        assert "structures" in analysis._VOLUME_ROOTS
+        assert analysis._VOLUME_ROOTS.index("structures") < analysis._VOLUME_ROOTS.index(
+            "."
+        )
+
     def test_the_first_root_holding_a_summary_wins(self, tmp_path):
         later = tmp_path / "b" / "camp" / "run"
         later.mkdir(parents=True)
