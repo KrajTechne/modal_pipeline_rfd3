@@ -1315,6 +1315,38 @@ Values run continuously 0.000 -> 0.010 -> 0.013, and every one of them means
 the same thing: no confident interface. Do not treat an exact 0.0 as a distinct
 failure mode.
 
+### Holo and CV are supposed to disagree
+
+Read the cross-validation columns the right way round. `alphav_beta3_02`
+cross-validated 138 sequences and only **16** came back agreeing with holo on
+placement and motif; the other 122 are the expected case, not a yield problem.
+The 16 are the result *because* two independent models concurred where they
+usually do not.
+
+Two corollaries, both of which were got wrong once already:
+
+* **No holo metric predicts CV agreement, and that is the premise rather than
+  a finding.** Comparing the 16 against the other 122, every holo distribution
+  sits on top of the other -- ipSAE 0.626 vs 0.528 median, ipTM 0.910 vs 0.894,
+  placement 2.095 vs 2.772, pLDDT 84.2 vs 84.3 -- and the ranges overlap
+  completely: an agreed sequence scored ipSAE 0.040 while non-agreed ones reach
+  0.726. If holo could predict it, CV would be measuring nothing. So the holo
+  gate's job is to choose what is worth cross-validating, never to anticipate
+  the verdict, and tightening it to shrink the CV bill trades designs for
+  money: `holo_ipsae_min >= 0.5` cuts CV to 57% of its cost and loses 6 of the
+  16; `placement <= 2.5` cuts it to 45% and loses 5.
+* **Every spec is judged on the same thresholds.** They live on
+  `campaign.refolding`, not on `SpecConfig`, and that is deliberate.
+  `rgd_extended` returning zero survivors from 40 designs against the same bar
+  that `rgd_core` cleared is *the result* -- the comparison is why two specs
+  are in one campaign. Per-spec thresholds would make the two columns
+  incomparable and destroy it.
+
+Also beware generalising from one structure. `rgd_core_2_model_1_seq4`'s apo
+fold visibly clashes with its holo and CV poses, but `holo_rmsd_apo_holo`
+medians 1.59 A over all 292 holo folds -- that design sits in the top decile of
+apo/holo disagreement, and it was picked for its ipSAE, not for being typical.
+
 ### At holo, ipSAE at cutoff 10 tracks placement; at CV it does not
 
 `alphav_beta3_02`, bucketed on `rmsd_binder_on_target`. `zeros` is how many of
