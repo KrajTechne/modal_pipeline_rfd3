@@ -19,5 +19,10 @@ out/
 outputs/
 *.log
 
+# Structures pulled off the volume to look at. Derived artifacts -- every one
+# is reproducible with `modal volume get`, and CIFs are large enough that
+# committing them would bloat an already OneDrive-synced tree.
+structures/
+
 # Probe scratch: the files worth keeping are copied into tests/fixtures/
 experiments/rfd3_output/
