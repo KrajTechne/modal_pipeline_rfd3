@@ -1356,10 +1356,17 @@ median of 0.000 hides whether it was half the bucket or all of it.
 ```
 holo (n=292)                       cv (n=138)
 placement     n  zeros    med      placement     n  zeros    med     max
-< 5 A       154      2  0.513      < 5 A        40      8  0.191   0.580
+< 5 A       154      2  0.511      < 5 A        40      8  0.191   0.580
 5-15 A       52     17  0.048      5-15 A       32     22  0.000   0.364
 > 15 A       86     45  0.000      > 15 A       66     49  0.000   0.435
 ```
+
+Reproduce with `analysis.bucket(records, "<stage>_ipsae_min",
+"<stage>_rmsd_binder_on_target")`. The holo median reads 0.511 and not 0.513
+because the first version of this table came from a scratch script taking
+`values[len(values) // 2]`, where the module takes a nearest-rank quantile --
+which is the convention everywhere else here, and the reason the analysis now
+lives in a tested module rather than in whatever script is to hand.
 
 Holo is the clean half. Across the 138 sequences that passed the holo gate
 there is **not one zero** and the median is 0.532; across the 154 that failed,
@@ -1394,6 +1401,41 @@ a catastrophic interface in any table rather than as "not applicable".
 `_refold_metrics` now omits the key for apo, and since the CSV's columns are
 derived from the keys actually present, the column disappears with it. `ptm` is
 kept: it is a monomer score and means something for a lone binder.
+
+### Analysing a finished run
+
+`rfd3_pipeline.analysis` reads the `summary.csv` / `summary.json` that `reduce`
+already wrote and recomputes nothing, so an analysis cannot disagree with the
+artifact it describes. Two callers, deliberately thin:
+
+* `experiments/metrics_table.py <summary.csv> [summary.json]` -- the funnel,
+  per-stage distributions, which gate terms rejected anything, holo against CV.
+* `experiments/campaign_analysis.ipynb` -- the same functions interactively.
+
+**Add a question to the module, not to a caller.** Both the four-sequence table
+that drove the 2026-10-09 gate revision and the ipSAE tables above started as
+throwaway scripts, and the second one already disagreed with itself about a
+median (see above). The module is standard-library only so that a Modal
+notebook kernel can import it with no image to build.
+
+For a notebook on Modal: attach the `rfd3-pipeline` volume from the Files panel
+(it mounts at `/mnt/rfd3-pipeline`, per Modal's notebook docs) and run `modal
+run app.py::publish_tools` once, which copies the package to
+`{DATA}/_tools/rfd3_pipeline` for the notebook to import. Re-run it after
+changing the module, or the notebook analyses a campaign with stale
+conventions. `analysis.find_run` resolves `/data`, `/mnt/rfd3-pipeline` and `.`
+in that order, so the same notebook works in a container, in a Modal notebook
+and against a local copy without edits.
+
+**`modal run` needs `PYTHONPATH=src`.** Every image ends with
+`add_local_python_source("rfd3_pipeline")`, which imports the package *locally*
+at build time to find its files. The package lives under `src/` and is not
+pip-installed, so without that variable every entrypoint fails with
+`ModuleNotMountable('rfd3_pipeline has no spec - might not be installed?')`
+before reaching Modal at all. Also set `PYTHONIOENCODING=utf-8` on Windows:
+the CLI prints a `U+2713` tick that a cp1252 console cannot encode, and the
+resulting `charmap` traceback looks like a failed run when the function
+actually succeeded.
 
 ---
 

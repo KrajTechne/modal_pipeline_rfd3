@@ -2951,6 +2951,52 @@ def reduce_only(campaign: str, dry_run: bool = False):
     )
 
 
+@app.local_entrypoint()
+def publish_tools():
+    """Copy `rfd3_pipeline` onto the volume, for notebooks to import.
+
+    A Modal notebook attaches the volume at `/mnt/rfd3-pipeline` and has no
+    checkout, so `experiments/campaign_analysis.ipynb` would have nothing to
+    import. `analysis` is standard-library only precisely so that a copy on the
+    volume is enough -- no image to build, no numpy to install.
+
+    Run it again after changing the module; the notebook reads whatever is
+    there, so a stale copy would analyse a campaign with old conventions.
+    """
+    _show(_publish_tools.remote())
+
+
+@app.function(image=cpu_image, volumes=VOLUMES, timeout=600)
+def _publish_tools() -> dict:
+    """Write the installed package to `{DATA}/_tools/rfd3_pipeline`.
+
+    Sourced from the image rather than from a local directory: `cpu_image`
+    already carries the package via `add_local_python_source`, so this cannot
+    publish a copy that differs from the one the pipeline itself ran.
+    """
+    import shutil
+    from pathlib import Path
+
+    import rfd3_pipeline
+
+    source = Path(rfd3_pipeline.__file__).parent
+    target = Path(DATA) / "_tools" / "rfd3_pipeline"
+    if target.exists():
+        shutil.rmtree(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    # `__pycache__` would be bytecode from another interpreter; the notebook
+    # kernel must compile these itself.
+    shutil.copytree(source, target, ignore=shutil.ignore_patterns("__pycache__"))
+    data_volume.commit()
+    modules = sorted(path.name for path in target.glob("*.py"))
+    return {
+        "published_to": str(target),
+        "n_modules": len(modules),
+        "has_analysis": "analysis.py" in modules,
+        "import_from": f"{Path(DATA) / '_tools'} (or /mnt/rfd3-pipeline/_tools)",
+    }
+
+
 def _show(report: dict, indent: str = "") -> None:
     for key, value in report.items():
         if isinstance(value, dict):
