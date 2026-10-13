@@ -7,6 +7,7 @@ from conftest import build
 from pydantic import ValidationError
 
 from rfd3_pipeline.config import (
+    IpsaeConfig,
     MODEL_CAPABILITIES,
     CampaignConfig,
     FoldingModel,
@@ -25,7 +26,7 @@ class TestCampaignParses:
         assert config.general.chain_binder == "A"
         assert config.general.chain_targets == ["B", "C"]
         assert config.rfdiffusion3.ligand == "E703"
-        assert config.cross_validation.model is FoldingModel.AF3_JAX
+        assert config.cross_validation.model is FoldingModel.AF3_FORK
 
     def test_design_counts(self, raw):
         config = CampaignConfig.model_validate(raw)
@@ -212,10 +213,22 @@ class TestModelCapabilities:
                     build(raw, refolding={"model": model, "target_template": True})
                 )
 
-    def test_af3_defaults_variant_and_weights(self, raw):
+    def test_the_fork_takes_no_variant_and_defaults_its_weights(self, raw):
+        """The shipped campaign cross-validates on `af3_fork`, which names its
+        weights directory outright via `--model_dir` -- so there is no variant
+        to derive, and the default must be the Apache-licensed set rather than
+        the non-commercial one."""
         config = CampaignConfig.model_validate(raw)
-        assert config.cross_validation.variant == "p2"
+        assert config.cross_validation.variant is None
         assert config.cross_validation.weights is Weights.OPENFOLD3
+
+    def test_the_kit_still_derives_its_fixed_variant(self, raw):
+        """`fixed_variant` is filled in when absent, which is what af3_jax
+        relies on and what the fork deliberately does not have."""
+        config = CampaignConfig.model_validate(
+            build(raw, cross_validation={"model": "af3_jax", "mode": "exact"})
+        )
+        assert config.cross_validation.variant == "p2"
 
     def test_weights_rejected_for_single_checkpoint_models(self, raw):
         """Previously only checked on whichever branch nothing else claimed."""
@@ -227,13 +240,31 @@ class TestModelCapabilities:
 
     def test_msa_consumption_read_from_the_table(self, raw):
         assert CampaignConfig.model_validate(raw).refolding.consumes_msa is True
-        fast = CampaignConfig.model_validate(build(raw, refolding={"model": "esmfold2-fast"}))
-        assert fast.refolding.consumes_msa is False
+        # Read from the table rather than through a campaign: a non-MSA model
+        # is no longer a valid *refolding* choice, so one cannot be built.
+        assert MODEL_CAPABILITIES[FoldingModel.ESMFOLD2_FAST].consumes_msa is False
+
+    def test_a_refolding_model_that_reads_no_msas_is_rejected(self, raw):
+        """Holo would fold its targets from sequence alone and still report
+        interface metrics."""
+        with pytest.raises(ValidationError, match="does not read "):
+            CampaignConfig.model_validate(build(raw, refolding={"model": "esmfold2-fast"}))
 
     def test_seed_style_read_from_the_table(self, raw):
+        """Both LIST, including af3_jax. Its `--num_seeds` is optional and the
+        fold-input JSON carries its own `modelSeeds`, so cross-validation's
+        seeds can be ours -- which is what makes a CV run comparable."""
         config = CampaignConfig.model_validate(raw)
         assert config.refolding.seed_style is SeedStyle.LIST
-        assert config.cross_validation.seed_style is SeedStyle.COUNT
+        assert config.cross_validation.seed_style is SeedStyle.LIST
+
+    def test_seed_sequence_matches_what_num_seeds_would_have_derived(self):
+        """`folding_input.py:1514` builds `range(base, base + N)`. Our own
+        helper computes the same list, so choosing the seeds explicitly loses
+        nothing against letting the fork derive them."""
+        from rfd3_pipeline.config import seed_sequence
+
+        assert seed_sequence(7, 5) == list(range(7, 7 + 5))
 
     @pytest.mark.parametrize(
         ("model", "msa", "expected"),
@@ -289,9 +320,24 @@ class TestMsa:
 
 
 class TestIpsaeAndMpnn:
-    def test_cutoffs_are_ten_not_fifteen(self, raw):
+    def test_the_pae_cutoff_is_ten(self, raw):
+        """Stricter than the reference implementations' 15, which is why the
+        plan stated it explicitly. The cutoff is not cosmetic: ipSAE counts
+        only residue pairs below it, so cross-validation reads exactly 0 here
+        -- its closest binder-target PAE is 10.6 to 12.8."""
+        assert CampaignConfig.model_validate(raw).ipsae.pae_cutoff == 10.0
+
+    def test_both_folding_stages_read_one_cutoff(self, raw):
+        """One field, so holo and cross-validation cannot diverge -- scores at
+        different cutoffs are not comparable, and comparing them is the point
+        of the stage."""
         config = CampaignConfig.model_validate(raw)
-        assert (config.ipsae.pae_cutoff, config.ipsae.dist_cutoff) == (10.0, 10.0)
+        assert config.ipsae.pae_cutoff == IpsaeConfig().pae_cutoff
+
+    def test_dist_cutoff_is_recorded_but_unconsumed(self, raw):
+        """`metrics/ipsae.py` is PAE-only. Kept so the intended value is not
+        lost, but tuning it changes nothing today."""
+        assert CampaignConfig.model_validate(raw).ipsae.dist_cutoff == 10.0
 
     def test_mpnn_defaults_to_soluble(self, raw):
         assert CampaignConfig.model_validate(raw).mpnn.mpnn_type is MpnnType.SOLUBLE

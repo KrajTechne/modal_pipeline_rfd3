@@ -39,7 +39,9 @@ __all__ = [
 UNKNOWN_RESIDUE = "X"
 
 
-def load_structure(path: str | Path, model: int = 1):
+def load_structure(
+    path: str | Path, model: int = 1, extra_fields: Sequence[str] | None = None
+):
     """Read a structure file, optionally gzipped, as an AtomArray.
 
     Format dispatch is biotite's, so every format it supports works here and no
@@ -47,12 +49,19 @@ def load_structure(path: str | Path, model: int = 1):
     kits emit. Gzip is the one thing biotite's loader does not handle: its entry
     point takes a path rather than a handle, so a compressed file is expanded to
     a temporary copy that keeps the inner extension and is removed afterwards.
+
+    `extra_fields` names annotations biotite does not read by default. The one
+    this pipeline needs is `b_factor`, which is where the folding kits write
+    pLDDT -- without asking for it the attribute is simply absent, so reading
+    confidence from a prediction fails with `AttributeError` rather than
+    returning anything wrong.
     """
     import biotite.structure.io as structure_io
 
+    fields = list(extra_fields) if extra_fields else None
     path = Path(path)
     if path.suffix.lower() != ".gz":
-        return structure_io.load_structure(path, model=model)
+        return structure_io.load_structure(path, model=model, extra_fields=fields)
 
     inner_suffix = Path(path.stem).suffix
     if not inner_suffix:
@@ -66,7 +75,7 @@ def load_structure(path: str | Path, model: int = 1):
         with gzip.open(path, "rb") as compressed:
             shutil.copyfileobj(compressed, temporary)
     try:
-        return structure_io.load_structure(expanded, model=model)
+        return structure_io.load_structure(expanded, model=model, extra_fields=fields)
     finally:
         expanded.unlink(missing_ok=True)
 

@@ -14,7 +14,7 @@ from .interface import InterfaceResult, binding_interface, epitope_coverage
 from .ipsae import d0_from_n0, directional_ipsae, ipsae_from_pae
 from .rmsd import (
     TargetSuperposition,
-    rmsd_binder_apo_holo,
+    rmsd_binder_fold,
     rmsd_binder_on_target,
     rmsd_motif_on_target,
     superimpose_rmsd,
@@ -31,7 +31,7 @@ __all__ = [
     "expected_radius_of_gyration",
     "ipsae_from_pae",
     "rg_report",
-    "rmsd_binder_apo_holo",
+    "rmsd_binder_fold",
     "rmsd_binder_on_target",
     "rmsd_motif_on_target",
     "superimpose_rmsd",

@@ -12,7 +12,18 @@ general:
   chain_binder: A
   chain_targets: [B, C]          # list, not a comma string
   name_design_campaign: motif_scaffold_alphav_beta3
-  run_name: alphav_beta3_01
+  # 03: the second full campaign, 2026-10-13. Everything but this name is
+  # identical to 02 on purpose -- it is a second independent sample under the
+  # same conditions, which is what the gate thresholds need before any of them
+  # moves. `rfdiffusion3.seed` is null for a full campaign, so sampling is
+  # unseeded and the 80 backbones are new rather than a replay (app.py:384).
+  #
+  # A fresh name each run also keeps `skip_existing` honest: RFD3 skips designs
+  # already in the run directory, so reusing a name would resume rather than
+  # re-sample. 01 holds only a stale summary pair from a `reduce_only` against
+  # the wrong directory; 02 is the first full campaign, recorded in
+  # runs/alphav_beta3_02.md.
+  run_name: alphav_beta3_03
   base_seed: 0                   # cross-validation seeds derive from this
 
   # Keyed by chain so each can be asserted against the input structure at load.
@@ -113,28 +124,53 @@ refolding:
   # both under esmfold2-fast, where a target MSA would be ignored).
   model: esmfold2
   mode: fast                     # off | exact | fast | big
-  gpu: A100-80GB                 # the kit --config card is derived from this
+  gpu: A100-40GB                 # the kit --config card is derived from this
   n_gpu_shard: 1                 # >1 only under mode: big (2|4|8)
   max_concurrent: 4              # Modal containers (was `n_gpu`)
   chunk_size: 24                 # sequences per container; amortizes model load
   target_template: false         # esmfold2 cannot template; true is rejected
 
+  # The apo gate, and all of it. Apo folds the binder alone, so confidence is
+  # what it can judge. `apo_rmsd_to_design` is recorded and watched, not gated.
   threshold_plddt_binder: 70
-  threshold_rmsd_apo_holo: 4.0
+
+  # The holo gate [revised 2026-10-09]: placement, interface confidence, and
+  # the motif when a spec scaffolds one. Fitted on the targets, so a binder
+  # that folds correctly and docks elsewhere no longer passes.
+  threshold_rmsd_binder_on_target: 5.0
   threshold_rmsd_motif: 2.0
-  threshold_ipTM: 0.3
+  # Raised from 0.3, which was doing no work: every sequence measured scored
+  # 0.735-0.908, so one other term carried the whole gate.
+  threshold_ipTM: 0.7
+
+  # Diagnostic only -- no longer gated. It measures fold change and is blind to
+  # placement, and it passed a design whose binder sat 21 A from its design
+  # while rejecting one that placed the motif to 0.76 A.
+  threshold_rmsd_apo_holo: 4.0
 
 cross_validation:                # was `cross-validation`; hyphen is awkward in Python
-  model: af3_jax
-  variant: p2                    # names the checkpoint the kit loads
+  # The sokrypton/alphafold3 fork driven directly, not the af3_jax kit. The kit
+  # exits `5 kernels_refused` in every mode -- its own lock pins tokamax 0.0.12
+  # against an MLIR that dropped the accessor tokamax calls -- while this one
+  # ran clean end to end on 2026-10-09. Switching back is one word, and the
+  # capability rows differ in what they accept, so a stale `variant`/`mode`
+  # will be rejected rather than ignored.
+  model: af3_fork
+  # No `variant`: the fork names its weights directory outright via
+  # `--model_dir`, so there is nothing for a variant to select.
   weights: openfold3             # openfold3 | af3_native -- see note below
-  mode: exact
+  # No `mode` or `n_gpu_shard` either; both are kit concepts. `n_gpu_shard`
+  # other than 1 is rejected for a directly-called model rather than silently
+  # doing nothing.
   gpu: A100-80GB
-  n_gpu_shard: 1
   max_concurrent: 4
   chunk_size: 8
   target_template: false
-  num_seeds: 5                   # seeds derived from general.base_seed
+  # Seeds derived from general.base_seed, passed as the input JSON's
+  # `modelSeeds`. One diffusion sample per seed, so this is 5 predictions per
+  # sequence -- note `--num_diffusion_samples` defaults to 5 upstream, which
+  # would have made it 25.
+  num_seeds: 5
 
 msa:
   host_url: https://api.colabfold.com
@@ -148,7 +184,14 @@ msa:
   auth_header: null
 
 ipsae:
-  pae_cutoff: 10                 # explicit: the helper defaults to 15
+  # One cutoff for holo and cross-validation alike: scores at different
+  # cutoffs are not comparable, and comparing them is the point of the stage.
+  # Stricter than the reference implementations' 15, stated explicitly because
+  # an unstated 10 would be silently ignored. Expect `cv_ipsae_*` of 0.0 here:
+  # OpenFold3's closest binder-target PAE is 10.6-12.8, so nothing qualifies.
+  # `pae_floor_<target>` in the summary is what makes that readable.
+  pae_cutoff: 10
+  # Not consumed: the in-process ipSAE is PAE-only. Recorded for the day it is.
   dist_cutoff: 10
 
 run:
