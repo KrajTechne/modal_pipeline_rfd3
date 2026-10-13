@@ -35,18 +35,27 @@ METRICS = (
     ("plddt_binder", "pLDDT"),
     ("iptm", "ipTM"),
     ("ipsae_min", "ipSAE"),
-    # The reference implementation's headline, recorded for comparison with a
-    # published threshold. The pipeline decides on `ipsae_min`.
-    ("ipsae_max_B", "ipSAE max B"),
-    ("ipsae_max_C", "ipSAE max C"),
     ("rmsd_to_design", "fold->design"),
     ("rmsd_apo_holo", "fold apo/holo"),
     ("rmsd_binder_on_target", "placement"),
     ("rmsd_motif_on_target", "motif"),
     ("rmsd_to_holo", "fold->holo"),
     ("rmsd_placement_vs_holo", "placement->holo"),
-    ("pae_floor_B", "PAE floor B"),
-    ("pae_floor_C", "PAE floor C"),
+)
+
+# Metrics recorded once per protein target, where the chain id is part of the
+# column name. Discovered from the columns present rather than listed: a
+# campaign's targets come from its YAML, so hardcoding B and C meant a third
+# target was computed and written to the CSV and then shown in no table at all.
+PER_TARGET = (
+    # The minimum over the two directions -- what the pipeline decides on.
+    ("ipsae_min_", "ipSAE min"),
+    # The maximum, which is the Dunbrack reference's headline `ipsae_d0res_max`
+    # and so the one comparable with a published threshold.
+    ("ipsae_max_", "ipSAE max"),
+    # How far outside `pae_cutoff` the closest pair fell, which is what makes
+    # an ipSAE of exactly 0.0 readable rather than mysterious.
+    ("pae_floor_", "PAE floor"),
 )
 
 # Where a campaign's artifacts turn up, most specific first: inside a pipeline
@@ -160,6 +169,37 @@ def column_for(
     return direct, ""
 
 
+def per_target_columns(
+    records: Sequence[Mapping[str, object]], stage: str, family: str
+) -> list[tuple[str, str]]:
+    """`(column, target)` for every target this run recorded under `family`.
+
+    `family` is a prefix such as `ipsae_min_`. Read off the columns actually
+    present, so two targets or five both work without this module knowing the
+    campaign's chain ids.
+    """
+    head = records[0] if records else {}
+    prefix = f"{stage}_{family}"
+    return sorted(
+        (column, column[len(prefix) :])
+        for column in head
+        if column.startswith(prefix) and column[len(prefix) :]
+    )
+
+
+def _spread(stage: str, label: str, values: Sequence[float]) -> dict:
+    return {
+        "stage": stage,
+        "metric": label,
+        "n": len(values),
+        "min": values[0],
+        "p25": quantile(values, 0.25),
+        "med": quantile(values, 0.5),
+        "p75": quantile(values, 0.75),
+        "max": values[-1],
+    }
+
+
 def distribution(records: Sequence[Mapping[str, object]], stage: str) -> list[dict]:
     """Spread of each of `stage`'s metrics: what calibrating a threshold needs.
 
@@ -170,20 +210,13 @@ def distribution(records: Sequence[Mapping[str, object]], stage: str) -> list[di
     for suffix, label in METRICS:
         column, qualifier = column_for(records, stage, suffix)
         values = numbers(records, column)
-        if not values:
-            continue
-        rows.append(
-            {
-                "stage": stage,
-                "metric": f"{label}{qualifier}",
-                "n": len(values),
-                "min": values[0],
-                "p25": quantile(values, 0.25),
-                "med": quantile(values, 0.5),
-                "p75": quantile(values, 0.75),
-                "max": values[-1],
-            }
-        )
+        if values:
+            rows.append(_spread(stage, f"{label}{qualifier}", values))
+    for family, label in PER_TARGET:
+        for column, target in per_target_columns(records, stage, family):
+            values = numbers(records, column)
+            if values:
+                rows.append(_spread(stage, f"{label} {target}", values))
     return rows
 
 
@@ -235,14 +268,18 @@ def compare(
         "iptm",
         "ipsae_min",
         "plddt_binder",
-        "pae_floor_B",
     ),
+    per_target: bool = True,
 ) -> list[dict]:
     """Two stages' metrics side by side, on the rows that reached both.
 
     The point of cross-validating is this table: on `alphav_beta3_02` the two
     models agreed on fold (1.11 -> 1.69 A median) and disagreed on placement
     (2.72 -> 13.10 A), which no single-model column could have shown.
+
+    `per_target` appends one row per protein target for each `PER_TARGET`
+    family, discovered from the columns. `pae_floor_B` used to be a hardcoded
+    default here, which quietly assumed the campaign had a chain B.
     """
     both = [r for r in records if reached(r, left, right)]
     rows = []
@@ -262,6 +299,24 @@ def compare(
                 f"{right}_med": quantile(right_values, 0.5),
             }
         )
+
+    if not per_target:
+        return rows
+    for family, label in PER_TARGET:
+        for _, target in per_target_columns(records, left, family):
+            left_values = numbers(both, f"{left}_{family}{target}")
+            right_values = numbers(both, f"{right}_{family}{target}")
+            if not left_values or not right_values:
+                continue
+            rows.append(
+                {
+                    "metric": f"{label} {target}",
+                    f"{left}_p25": quantile(left_values, 0.25),
+                    f"{left}_med": quantile(left_values, 0.5),
+                    f"{right}_p25": quantile(right_values, 0.25),
+                    f"{right}_med": quantile(right_values, 0.5),
+                }
+            )
     return rows
 
 

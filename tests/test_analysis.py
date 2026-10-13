@@ -105,6 +105,58 @@ class TestColumns:
         assert "ipTM" not in {row["metric"] for row in rows}
 
 
+class TestPerTargetDiscovery:
+    """Target chains come from the campaign YAML, so they cannot be listed here.
+
+    `pae_floor_B` / `pae_floor_C` were hardcoded in `METRICS`, and
+    `pae_floor_B` was a hardcoded default of `compare`. A campaign with a third
+    target computed `ipsae_min_D` and `pae_floor_D`, wrote them to the CSV, and
+    showed them in no table at all.
+    """
+
+    THREE = [
+        {
+            "seq_id": "s1", "design_id": "d", "spec_name": "s",
+            "holo_plddt_binder": "80.0",
+            "holo_ipsae_min": "0.2",
+            "holo_ipsae_min_B": "0.2", "holo_ipsae_min_C": "0.4",
+            "holo_ipsae_min_D": "0.6",
+            "holo_ipsae_max_B": "0.3", "holo_ipsae_max_C": "0.5",
+            "holo_ipsae_max_D": "0.7",
+            "holo_pae_floor_B": "1.0", "holo_pae_floor_C": "2.0",
+            "holo_pae_floor_D": "3.0",
+            "cv_plddt_binder": "78.0",
+            "cv_ipsae_min_B": "0.1", "cv_ipsae_min_C": "0.2",
+            "cv_ipsae_min_D": "0.3",
+            "cv_pae_floor_B": "8.0", "cv_pae_floor_C": "9.0",
+            "cv_pae_floor_D": "10.0",
+        }
+    ]
+
+    def test_every_target_is_discovered(self):
+        found = analysis.per_target_columns(self.THREE, "holo", "ipsae_min_")
+        assert [target for _, target in found] == ["B", "C", "D"]
+
+    def test_the_bare_summary_is_not_mistaken_for_a_target(self):
+        """`holo_ipsae_min` has no target suffix and must not become one."""
+        found = analysis.per_target_columns(self.THREE, "holo", "ipsae_min_")
+        assert all(column != "holo_ipsae_min" for column, _ in found)
+
+    def test_a_third_target_reaches_the_distribution_table(self):
+        labels = {row["metric"] for row in analysis.distribution(self.THREE, "holo")}
+        assert {"ipSAE min D", "ipSAE max D", "PAE floor D"} <= labels
+
+    def test_a_third_target_reaches_the_comparison(self):
+        labels = {row["metric"] for row in analysis.compare(self.THREE)}
+        assert {"ipSAE min D", "PAE floor D"} <= labels
+
+    def test_per_target_rows_can_be_turned_off(self):
+        labels = {
+            row["metric"] for row in analysis.compare(self.THREE, per_target=False)
+        }
+        assert not any(label.endswith(" D") for label in labels)
+
+
 class TestGateTerms:
     def test_sole_reason_ignores_designs_that_failed_several_terms(self):
         work = analysis.gate_terms(RECORDS, "holo")
