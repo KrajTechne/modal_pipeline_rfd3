@@ -75,12 +75,30 @@ has no homologs, so it must get `msa: empty`.
 
 Two consequences:
 
-* **`msa_paired=False` is correct** and the row's UNVERIFIED flag can go. There
-  is no paired-MSA field; Boltz pairs internally by taxonomy, reading
-  `taxonomy_id` out of `>UniRef100` headers (`parse/a3m.py:48`). The concern in
-  that comment — silently under-supplying — does not apply. **But our cached
-  a3m must keep its UniRef100 headers**, or Boltz cannot pair at all. Check
-  this against the cache before trusting any multimer prediction.
+* **`msa_paired=False` is correct** and the row's UNVERIFIED flag can go —
+  but for a stronger reason than first written here. There is no paired-MSA
+  field, *and* **a custom a3m gets no cross-chain pairing at all**:
+  `main.py:618` calls `parse_a3m(msa_path, taxonomy=None, …)` on every
+  prediction, so the `if taxonomy and header.startswith(">UniRef100")` branch
+  at `parse/a3m.py:48` is dead and every sequence is read with
+  `taxonomy_id = -1`. Pairing happens only on the `--use_msa_server` path,
+  where `msa_pairing_strategy` is handed to the server and the server returns
+  the pairing.
+
+  Corrected 2026-10-13: an earlier draft of this plan said Boltz pairs
+  internally from our `>UniRef100` headers and that the cache therefore had to
+  preserve them. The cache *does* preserve them — 2,658 of 4,481 headers in
+  `msa_cache/a4766…a3m` are `>UniRef100_…`, the rest being `SRR`/`ERR`/`MGYP`
+  environmental hits with no taxonomy — but it makes no difference, because
+  nothing reads them.
+
+  The real consequence: **feeding the cache gives Boltz unpaired information
+  only.** That is a known limitation, not a bug, and it may not matter — the
+  one measurement we have says 1,771 paired rows per target chain changed AF3's
+  ipTM, pTM and ranking_score not at all (`Notes.md`, 2026-10-09, one
+  sequence). Whether Boltz is likewise indifferent is unmeasured. The
+  alternative is `--use_msa_server`, which abandons the cache and re-fetches
+  per prediction, so it is not obviously worth it.
 * `empty` sets neither the custom nor the auto flag, so binder-`empty` plus
   targets-with-paths avoids `"Cannot mix custom and auto-generated MSAs in the
   same input!"` (`schema.py:1311`). The combination we need is legal.
@@ -249,9 +267,12 @@ switched off on that card, reported as `card_off=<lever>:<reason>` on the
 
 ## Open questions
 
-1. **Does our MSA cache keep UniRef100 headers?** If not, Boltz cannot pair and
-   every multimer prediction is quietly weaker. Cheap to check and it blocks
-   nothing else, but it must be answered before trusting holo or CV numbers.
+1. ~~Does our MSA cache keep UniRef100 headers?~~ **Answered 2026-10-13: yes
+   (2,658 of 4,481), and it turns out not to matter** — `taxonomy=None` makes
+   the lookup dead code, so a custom a3m is never paired. See the MSA section.
+   What remains open is whether unpaired-only input measurably hurts Boltz on
+   this campaign's two targets; that is a question for phase 5, answerable by
+   folding a handful of sequences both ways.
 2. **How does `target_template` map?** Boltz takes `templates: - cif: <path>`
    for the whole complex, not per chain. `supports_templates=True` is honest
    about the model, but our config models templating as a per-target flag. A
