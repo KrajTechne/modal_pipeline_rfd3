@@ -24,7 +24,7 @@ comparison, and comparison is tedious when the headings move.
 | run | date | scale | result |
 |---|---|---|---|
 | [alphav_beta3_02](alphav_beta3_02.md) | 2026-10-12 | 80 designs, 8 seqs, 5 CV seeds | 16 agreed sequences / 9 designs |
-| [alphav_beta3_03](alphav_beta3_03.md) | 2026-10-13 | identical to 02 | running |
+| [alphav_beta3_03](alphav_beta3_03.md) | 2026-10-13 | identical to 02 | 28 agreed sequences / 12 designs |
 
 `alphav_beta3_01` has no record: it holds only a stale summary pair from a
 `reduce_only` against the wrong directory.

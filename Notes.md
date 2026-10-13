@@ -1315,6 +1315,48 @@ Values run continuously 0.000 -> 0.010 -> 0.013, and every one of them means
 the same thing: no confident interface. Do not treat an exact 0.0 as a distinct
 failure mode.
 
+### What two campaigns agree on, and what they do not
+
+`alphav_beta3_02` and `_03` were identical but for the run name — 80 designs
+each, unseeded sampling, the same thresholds. Per-run numbers live in `runs/`;
+these are the claims that survived both.
+
+**Held in both runs, so these are properties of the pipeline:**
+
+* **`threshold_ipTM: 0.7` does no independent work at holo.** 43 rejections in
+  02 and 16 in 03, and across 59 rejections **not one** turned on ipTM alone —
+  every one also failed a placement or motif term. Raising it from 0.3 made it
+  reject things; it still decides nothing. A candidate for removal.
+* **`threshold_hotspot_contacts: 0.4` never fires.** 0 of 160 designs.
+  `threshold_interresidue_clashes_sidechain: 3` has rejected 1 of 160 and is
+  close behind.
+* **Placement is bimodal, with the valley near 5 Å.** p25/med/p75 of 2.77 /
+  4.52 / 19.61 and 2.54 / 3.80 / 11.28. The binder lands on the epitope or sits
+  tens of Å away; `rmsd_binder_on_target <= 5.0` sits in the gap both times and
+  is the workhorse (42 then 37 sole rejections).
+* **Holo and CV reproduce each other's fold and disagree about docking.** Fold
+  medians 1.11 → 1.69 and 1.17 → 1.62; placement 2.72 → 13.10 and 2.63 →
+  13.52. CV ipTM runs ~0.21 below holo's in both runs, so **the holo threshold
+  must not be ported to CV**.
+* **ipSAE must inform CV ranking and never gate it.** Of the agreed sequences,
+  2 of 16 in 02 and **6 of 28** in 03 score `cv_ipsae_min` of exactly 0.000. A
+  gate would have discarded 12% then 21% of the confirmed designs.
+* **`rgd_extended` is a bad spec, not an unlucky one.** 80 designs across two
+  runs produced 1 agreed sequence against `rgd_core`'s 54. In 03 it fails
+  earlier, at the filters (29/40 against 36/40). Same thresholds for every
+  spec is the point — the comparison is why two specs share a campaign.
+
+**Did *not* hold, so do not quote these as pipeline behaviour:**
+
+* **The CV agreement rate.** 11.6% then 19.4%. Per-run.
+* **Pass rates to better than ±8 points.** Filters 87.5% → 81.3%, holo 47.3% →
+  **55.4%**. Apo alone was stable (52.1% → 50.0%).
+* **The CV ipSAE band medians.** The best placement band medianed 0.191 then
+  0.058.
+
+Two runs is enough to retire a gate term that fired zero times twice. It is not
+enough to move a threshold.
+
 ### Holo and CV are supposed to disagree
 
 Read the cross-validation columns the right way round. `alphav_beta3_02`
