@@ -142,6 +142,47 @@ agreed sequences, **6 have `cv_ipsae_min` of exactly 0.000** — 21%, where 02
 had 2 of 16 (12%). A CV ipSAE gate would have discarded a fifth of this run's
 confirmed designs.
 
+## The two target chains
+
+```
+holo, which target sets ipsae_min
+  B lower 116 (45%)   C lower 114 (44%)   tie 30
+|B - C| per design      med 0.012   p75 0.037   p90 0.064   max 0.129
+exact zeros   both chains 30   one chain 4   neither 226
+```
+
+**Neither target is the weak one**, and the per-design gap is a median 0.012.
+So `ipsae_min` is within a hair of both `ipsae_min_B` and `ipsae_min_C`, the
+minimum over targets costs essentially nothing, and `max_ipsae_min` has nothing
+to choose between — which is why it has never been informative. The designs
+engage both chains to the same degree, as RGD should: the Arg contacts the alphaV
+propeller (B) and the Asp completes the MIDAS coordination on beta3 (C).
+
+Zeros come in pairs — 30 folds zero on both chains, only 4 on one. When the
+interface fails it fails whole.
+
+```
+direction medians   A->B 0.460   B->A 0.317
+                    A->C 0.555   C->A 0.306
+```
+
+**Direction matters far more than chain**, and mechanically rather than
+biologically: a *binder* residue has 177-242 candidate partners so its n0 and
+hence d0 are large, inflating `1/(1+(PAE/d0)^2)`, while a *target* residue has
+only 111 binder partners. Longer target, higher binder-aligned score. So
+`ipsae_min` is in practice almost always the target-aligned value.
+
+```
+pair B, reference headline (max of directions) vs ours (min)
+  run 03   max 0.468   min 0.317   offset +0.151
+  run 02   max 0.357   min 0.223   offset +0.133
+```
+
+Our reported ipSAE runs **~0.14 below** what a published threshold was
+calibrated on. `ipsae_max_<target>` is absent from both runs' CSVs — the shards
+predate the change — but it is fully recoverable from the `ipsae_A_B` /
+`ipsae_B_A` columns that are present, as those numbers were.
+
 ## Per-spec, same thresholds
 
 ```

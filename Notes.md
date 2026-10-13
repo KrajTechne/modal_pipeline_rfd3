@@ -1341,6 +1341,26 @@ these are the claims that survived both.
 * **ipSAE must inform CV ranking and never gate it.** Of the agreed sequences,
   2 of 16 in 02 and **6 of 28** in 03 score `cv_ipsae_min` of exactly 0.000. A
   gate would have discarded 12% then 21% of the confirmed designs.
+* **Neither target chain is the weaker interface, so `max_ipsae_min` has
+  nothing to choose between.** `|ipsae_min_B - ipsae_min_C|` medians 0.011 and
+  0.012 across the two runs, and which chain is lower is near a coin flip. Both
+  the minimum over targets and that `max` are therefore nearly the same number
+  as either chain alone. Zeros also come in pairs — 30 folds zero on both
+  chains against 4 on one — so the interface fails whole rather than by chain.
+* **ipSAE's two *directions* differ far more than its two chains, and
+  mechanically.** Target->binder is systematically weaker: medians
+  A->B 0.460 / B->A 0.317 in 03 and 0.356 / 0.242 in 02. A *binder* residue has
+  177-242 candidate partners, so its n0 and hence d0 are large and inflate
+  `1/(1+(PAE/d0)^2)`; a *target* residue has only 111. Longer target, higher
+  binder-aligned score. Since `ipsae_min_<target>` takes the minimum of the
+  directions, it is in practice almost always the target-aligned value — a
+  property of the score's construction, not of the design.
+* **`ipsae_min` runs ~0.14 below the reference's headline.** Comparing the
+  minimum over directions with `ipsae_d0res_max` on pair B: 0.317 against 0.468
+  in 03, 0.223 against 0.357 in 02. **Do not hold `ipsae_min` against a
+  published cutoff** — it is a materially stricter bar than the paper applied.
+  `ipsae_max_<target>` exists for that comparison, and for runs predating it
+  the value is recoverable from the two `ipsae_<a>_<b>` columns.
 * **`rgd_extended` is a bad spec, not an unlucky one.** 80 designs across two
   runs produced 1 agreed sequence against `rgd_core`'s 54. In 03 it fails
   earlier, at the filters (29/40 against 36/40). Same thresholds for every
