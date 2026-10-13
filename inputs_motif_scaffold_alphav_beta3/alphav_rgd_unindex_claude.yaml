@@ -12,10 +12,18 @@ general:
   chain_binder: A
   chain_targets: [B, C]          # list, not a comma string
   name_design_campaign: motif_scaffold_alphav_beta3
-  # 02: the first full campaign. 01 holds only a stale summary pair from a
-  # `reduce_only` run against the wrong directory, and RFD3 skips designs
-  # already present -- so a fresh name keeps this run unambiguously one run.
-  run_name: alphav_beta3_02
+  # 03: the second full campaign, 2026-10-13. Everything but this name is
+  # identical to 02 on purpose -- it is a second independent sample under the
+  # same conditions, which is what the gate thresholds need before any of them
+  # moves. `rfdiffusion3.seed` is null for a full campaign, so sampling is
+  # unseeded and the 80 backbones are new rather than a replay (app.py:384).
+  #
+  # A fresh name each run also keeps `skip_existing` honest: RFD3 skips designs
+  # already in the run directory, so reusing a name would resume rather than
+  # re-sample. 01 holds only a stale summary pair from a `reduce_only` against
+  # the wrong directory; 02 is the first full campaign, recorded in
+  # runs/alphav_beta3_02.md.
+  run_name: alphav_beta3_03
   base_seed: 0                   # cross-validation seeds derive from this
 
   # Keyed by chain so each can be asserted against the input structure at load.

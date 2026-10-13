@@ -1402,6 +1402,24 @@ a catastrophic interface in any table rather than as "not applicable".
 derived from the keys actually present, the column disappears with it. `ptm` is
 kept: it is a monomer score and means something for a lone binder.
 
+### One run's numbers go in `runs/`, conclusions come here
+
+`runs/<run_name>.md` records what one campaign measured, in a fixed section
+order so two runs can be read side by side. `runs/README.md` has the index.
+
+**A number describing one run stays in `runs/` and stays true forever. A claim
+about the *pipeline* belongs in `Notes.md` and has to hold across runs.** So a
+finding graduates only when more than one run supports it, and the note here
+says which runs. Everything in section 9 derived from `alphav_beta3_02` is
+therefore provisional until `alphav_beta3_03` either repeats it or does not --
+including the two gate terms shown to do no work, and the claim that ipSAE
+tracks placement at holo.
+
+The reason for the split is that 02's result was 16 sequences collapsing into
+9 designs from two parent backbones. Written as a Notes.md conclusion that
+would read as a property of the pipeline; written as a run record it reads as
+what it is.
+
 ### Analysing a finished run
 
 `rfd3_pipeline.analysis` reads the `summary.csv` / `summary.json` that `reduce`
