@@ -158,10 +158,21 @@ def ipsae_from_pae(
 
         * `ipsae_min_<target>` -- the lower of the two directions for that
           target, since the score is asymmetric and the weaker direction is the
-          honest one.
-        * `ipsae_min` -- the lowest of those, i.e. the binder's worst interface.
-        * `max_ipsae_min` -- the best of them, reported only when there is more
-          than one target and so something to choose between.
+          honest one. **This is what the pipeline gates and ranks on.**
+        * `ipsae_max_<target>` -- the higher of the two, which is the reference
+          implementation's headline `ipsae_d0res_max`. Recorded only so a score
+          can be held against a published threshold, since those are derived
+          from the maximum.
+        * `ipsae_min` -- the lowest `ipsae_min_<target>`, i.e. the binder's
+          worst interface.
+        * `max_ipsae_min` -- the highest `ipsae_min_<target>`, reported only
+          with more than one target and so something to choose between.
+
+        **`ipsae_max_<target>` and `max_ipsae_min` are different things** and
+        sit one letter apart. The first maximises over the two *directions* of
+        one target; the second maximises over *targets* of each one's minimum.
+        For a binder on targets B and C, `ipsae_max_B` can exceed
+        `max_ipsae_min` while telling you nothing about C.
     """
     pae = np.asarray(pae)
 
@@ -219,16 +230,23 @@ def ipsae_from_pae(
 
     # Key by the target chain explicitly, never by pair position: the positional
     # form is correct only while the binder happens to sort first.
-    per_target = {
-        target: min(
+    directions = {
+        target: (
             results[f"ipsae_{binder_chain}_{target}"],
             results[f"ipsae_{target}_{binder_chain}"],
         )
         for target in chain_ids
         if target != binder_chain
     }
+    per_target = {target: min(pair) for target, pair in directions.items()}
     for target, value in per_target.items():
         results[f"ipsae_min_{target}"] = value
+        # The reference's headline `ipsae_d0res_max`, recorded so a score can be
+        # compared with a published threshold -- those are derived from the
+        # maximum, and `ipsae_min_<target>` is systematically stricter. The
+        # pipeline still gates and ranks on the minimum: the weaker direction is
+        # the honest one for a design we are deciding whether to believe.
+        results[f"ipsae_max_{target}"] = max(directions[target])
 
     if per_target:
         values = list(per_target.values())

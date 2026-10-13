@@ -35,6 +35,10 @@ METRICS = (
     ("plddt_binder", "pLDDT"),
     ("iptm", "ipTM"),
     ("ipsae_min", "ipSAE"),
+    # The reference implementation's headline, recorded for comparison with a
+    # published threshold. The pipeline decides on `ipsae_min`.
+    ("ipsae_max_B", "ipSAE max B"),
+    ("ipsae_max_C", "ipSAE max C"),
     ("rmsd_to_design", "fold->design"),
     ("rmsd_apo_holo", "fold apo/holo"),
     ("rmsd_binder_on_target", "placement"),

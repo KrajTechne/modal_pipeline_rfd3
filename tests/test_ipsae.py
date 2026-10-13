@@ -239,3 +239,93 @@ class TestAgreesWithTheDunbrackReference:
         chains = np.array(["A"] * 5 + ["B"] * 5)
         assert directional_ipsae(pae, slice(0, 5), slice(5, 10), 10.0) == 0.0
         assert self.reference_ipsae(pae, chains, "A", "B", 10.0) == 0.0
+
+
+class TestPerTargetMinAndMax:
+    """Both directions summarised, with the two `max` names kept apart.
+
+    `ipsae_max_<target>` maximises over the two *directions* of one target and
+    exists to be compared with a published threshold, which the reference
+    derives from the maximum. `max_ipsae_min` maximises over *targets* of each
+    one's minimum. They sit one letter apart and mean different things.
+    """
+
+    @staticmethod
+    def two_targets():
+        """A binder A on targets B and C, deliberately asymmetric.
+
+        B is confident from A's side only; C is confident from both. So B's
+        two directions disagree and C's agree, which is what separates the
+        min from the max.
+        """
+        lengths = {"A": 8, "B": 8, "C": 8}
+        pae = np.full((24, 24), 40.0)
+        pae[0:8, 8:16] = 3.0      # A -> B confident
+        pae[8:16, 0:8] = 25.0     # B -> A not
+        pae[0:8, 16:24] = 6.0     # A -> C confident
+        pae[16:24, 0:8] = 6.0     # C -> A likewise
+        return pae, list(lengths), list(lengths.values())
+
+    def test_min_and_max_bracket_the_two_directions(self):
+        pae, ids, lengths = self.two_targets()
+        out = ipsae_from_pae(
+            pae, ids, lengths, pae_cutoff=10.0, binder_chain="A", pairs="binder"
+        )
+        for target in ("B", "C"):
+            pair = (out[f"ipsae_A_{target}"], out[f"ipsae_{target}_A"])
+            assert out[f"ipsae_min_{target}"] == min(pair)
+            assert out[f"ipsae_max_{target}"] == max(pair)
+
+    def test_an_asymmetric_interface_separates_them(self):
+        """B is confident one way only, so its min and max must differ."""
+        pae, ids, lengths = self.two_targets()
+        out = ipsae_from_pae(
+            pae, ids, lengths, pae_cutoff=10.0, binder_chain="A", pairs="binder"
+        )
+        # B -> A has nothing under the cutoff, so the minimum is 0 while the
+        # maximum is whatever A -> B scored. No magnitude is asserted: with
+        # 8-residue chains n0 caps at 8, d0 floors at 1.0, and PAE 3.0 scores
+        # 1/(1+9) = 0.1 -- small, but entirely confident relative to the other
+        # direction, which is the only thing this test is about.
+        assert out["ipsae_min_B"] == 0.0
+        assert out["ipsae_max_B"] == out["ipsae_A_B"] > out["ipsae_min_B"]
+        assert out["ipsae_min_C"] == pytest.approx(out["ipsae_max_C"])
+
+    def test_the_two_max_names_are_not_the_same_quantity(self):
+        """The hazard the docstring warns about, pinned.
+
+        `ipsae_max_B` is high because A->B is confident; `max_ipsae_min` is C's
+        value, because B's minimum is 0.0. Reading one as the other would claim
+        a confident B interface that the reverse direction does not support.
+        """
+        pae, ids, lengths = self.two_targets()
+        out = ipsae_from_pae(
+            pae, ids, lengths, pae_cutoff=10.0, binder_chain="A", pairs="binder"
+        )
+        assert out["max_ipsae_min"] == out["ipsae_min_C"]
+        assert out["ipsae_max_B"] > out["max_ipsae_min"]
+
+    def test_max_matches_the_reference_headline(self):
+        """`ipsae_max_<target>` is the reference's `ipsae_d0res_max`."""
+        pae, ids, lengths = self.two_targets()
+        chains = np.array([c for c, n in zip(ids, lengths) for _ in range(n)])
+        out = ipsae_from_pae(
+            pae, ids, lengths, pae_cutoff=10.0, binder_chain="A", pairs="binder"
+        )
+        reference = TestAgreesWithTheDunbrackReference.reference_ipsae
+        for target in ("B", "C"):
+            headline = max(
+                reference(pae, chains, "A", target, 10.0),
+                reference(pae, chains, target, "A", 10.0),
+            )
+            assert out[f"ipsae_max_{target}"] == pytest.approx(headline, abs=1e-12)
+
+    def test_the_pipeline_still_decides_on_the_minimum(self):
+        """Adding the max must not change which number the gate reads."""
+        from rfd3_pipeline.gates import refold_gates
+        from rfd3_pipeline.config import FoldingModel, RefoldingConfig
+
+        gates = refold_gates(
+            RefoldingConfig(model=FoldingModel.ESMFOLD2), "holo", has_motif=True
+        )
+        assert not any("ipsae" in gate.metric for gate in gates)
