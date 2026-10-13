@@ -9,9 +9,12 @@ Definition, per ordered chain pair (aligned -> measured):
 
   1. For each residue i of the aligned chain, find the residues j of the measured
      chain with PAE(i, j) < `pae_cutoff`; let n0(i) be how many there are.
-  2. d0(i) = 1.24 * (n0(i) - 15)^(1/3) - 1.8, floored at 1.0. The floor is not
-     arbitrary: the expression crosses 1.0 at n0 = 27, so the piecewise function
-     is continuous there.
+  2. d0(i) = 1.24 * (n0(i) - 15)^(1/3) - 1.8 for n0 >= 27, and 1.0 below that.
+     The expression crosses 1.0 at n0 ~ 26.5, so this is **not** continuous:
+     n0 = 26 gives 1.0 and n0 = 27 gives 1.0389. The reference has the same
+     step, by a different route -- `calc_d0_array` clamps L to >= 26 and then
+     floors the result at 1.0 -- and `_d0_array` was verified equal to it for
+     every n0 from 0 to 200.
   3. Score residue i as the mean of 1 / (1 + (PAE(i, j) / d0(i))^2) over the
      passing j only.
   4. The directional ipSAE is the maximum over i.
@@ -19,9 +22,27 @@ Definition, per ordered chain pair (aligned -> measured):
 The score is asymmetric, so binder->target and target->binder differ; the
 pipeline reports the minimum of the two as `ipsae_min_<target>`.
 
-This implementation is PAE-only. The Dunbrack reference CLI additionally accepts
-a distance cutoff, so the two need not agree numerically -- the validation script
-runs both on known complexes and records the agreement before this is relied on.
+**Verified against DunbrackLab/IPSAE on 2026-10-13** (`ipsae.py` at `main`,
+the `ipSAE_d0res` path). Every ordered chain pair of a real 531-token holo PAE
+agreed to 2.2e-16, and `_d0_array` matches `calc_d0_array` exactly over
+n0 = 0..200. Both use a strict `<` against the cutoff and average only the
+passing pairs.
+
+Two differences remain, both deliberate:
+
+* **This reports the minimum of the two directions, the reference's headline
+  `ipsae_d0res_max` the maximum.** Per-direction values are identical, and both
+  are recorded as `ipsae_<aligned>_<measured>`, so either summary is
+  recoverable -- but `ipsae_min` is the stricter number and is not comparable
+  to a literature threshold derived from the reference's maximum.
+* This is PAE-only; the reference CLI also takes a distance cutoff, and its
+  `ipSAE_d0chn` / `ipSAE_d0dom` variants take d0 from chain or domain length
+  rather than per-residue n0. Those are different scores, not disagreements.
+
+Note that the reference's *scalar* `calc_d0` disagrees with its own
+`calc_d0_array` at exactly L = 27 (1.0 against 1.0389). The scalar is used only
+for `d0chn` and `d0dom`, never for the `d0res` path this module implements, so
+matching the array version is matching the right one.
 """
 
 from __future__ import annotations

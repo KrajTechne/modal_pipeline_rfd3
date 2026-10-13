@@ -7,14 +7,22 @@ from rfd3_pipeline.metrics import d0_from_n0, directional_ipsae, ipsae_from_pae
 
 
 class TestD0:
-    def test_floored_below_the_continuity_point(self):
+    def test_floored_below_the_switch_point(self):
         assert d0_from_n0(0) == 1.0
         assert d0_from_n0(26) == 1.0
 
-    def test_continuous_at_27(self):
-        # 1.24 * 12**(1/3) - 1.8 crosses 1.0 here, which is why the floor sits
-        # at 27 rather than at an arbitrary residue count.
-        assert d0_from_n0(27) == pytest.approx(1.0, abs=0.05)
+    def test_the_step_at_27_is_real_and_matches_the_reference(self):
+        """It is *not* continuous here, and the old name claimed it was.
+
+        `1.24 * (n0 - 15)**(1/3) - 1.8` crosses 1.0 at n0 ~ 26.5, so n0 = 26
+        gives 1.0 and n0 = 27 gives 1.0389. The reference reaches the same step
+        by clamping L to >= 26 and flooring at 1.0, so the step is a property of
+        the score and not of this implementation. Pinned to the exact value
+        because the previous assertion was `approx(1.0, abs=0.05)`, which passed
+        while encoding the wrong claim.
+        """
+        assert d0_from_n0(27) == pytest.approx(1.0389, abs=1e-4)
+        assert d0_from_n0(26) == 1.0
 
     def test_grows_with_interface_size(self):
         assert d0_from_n0(100) > d0_from_n0(50) > d0_from_n0(27)
@@ -153,3 +161,81 @@ class TestTheVectorisedD0MatchesItsReference:
             assert _d0_array(np.array([n])).ravel()[0] == pytest.approx(
                 d0_from_n0(n)
             )
+
+
+class TestAgreesWithTheDunbrackReference:
+    """Numeric agreement with DunbrackLab/IPSAE, so a rewrite cannot drift.
+
+    The reference is a CLI that parses structures and opens output files at
+    import, so its arithmetic is transcribed here rather than imported -- and
+    transcribed deliberately, since a copy that adapted our code would agree
+    with us by construction and prove nothing.
+
+    Transcribed from `ipsae.py` at `main` (verified 2026-10-13): `ptm_func`
+    line 111, `calc_d0_array` line 126, and the `ipSAE_d0res` loop at lines
+    783-801 whose per-pair value is the max over aligned residues (line 844).
+    """
+
+    @staticmethod
+    def reference_d0_array(n0):
+        """`calc_d0_array(L, 'protein')` -- clamp to >= 26, then floor at 1.0."""
+        length = np.maximum(26, np.asarray(n0, dtype=float))
+        return np.maximum(1.0, 1.24 * (length - 15) ** (1.0 / 3.0) - 1.8)
+
+    @classmethod
+    def reference_ipsae(cls, pae, chains, aligned, measured, pae_cutoff):
+        """`ipsae_d0res_asym[aligned][measured]`."""
+        valid = np.outer(chains == aligned, chains == measured) & (pae < pae_cutoff)
+        d0 = cls.reference_d0_array(valid.sum(axis=1))
+        per_residue = np.zeros(pae.shape[0])
+        for i in range(pae.shape[0]):
+            if chains[i] != aligned or not valid[i].any():
+                continue
+            scores = 1.0 / (1.0 + (pae[i] / d0[i]) ** 2.0)
+            per_residue[i] = scores[valid[i]].mean()
+        return float(per_residue.max())
+
+    def test_d0_matches_across_the_whole_range(self):
+        for n0 in range(201):
+            assert d0_from_n0(n0) == pytest.approx(
+                float(self.reference_d0_array(n0)), abs=1e-12
+            ), f"d0 diverges at n0={n0}"
+
+    def test_directional_scores_match_on_an_asymmetric_matrix(self):
+        """Both directions of both pairs, on a matrix with real structure.
+
+        Seeded rather than hand-written: a matrix simple enough to write out is
+        also simple enough to agree by accident. The confident block is what
+        keeps the scores off 0.0 and exercises the d0 switch.
+        """
+        rng = np.random.default_rng(20261013)
+        lengths = {"A": 20, "B": 35, "C": 15}
+        total = sum(lengths.values())
+        pae = rng.uniform(2.0, 30.0, size=(total, total))
+        # A confident patch between A and B, so n0 crosses 27 for some residues.
+        pae[0:12, 20:50] = rng.uniform(1.0, 9.0, size=(12, 30))
+        chains = np.array(
+            [chain for chain, n in lengths.items() for _ in range(n)]
+        )
+        blocks, start = {}, 0
+        for chain, n in lengths.items():
+            blocks[chain] = slice(start, start + n)
+            start += n
+
+        for aligned in lengths:
+            for measured in lengths:
+                if aligned == measured:
+                    continue
+                ours = directional_ipsae(
+                    pae, blocks[aligned], blocks[measured], 10.0
+                )
+                theirs = self.reference_ipsae(pae, chains, aligned, measured, 10.0)
+                assert ours == pytest.approx(theirs, abs=1e-12), (
+                    f"{aligned}->{measured} diverges: {ours} vs {theirs}"
+                )
+
+    def test_both_agree_that_nothing_under_the_cutoff_is_zero(self):
+        pae = np.full((10, 10), 50.0)
+        chains = np.array(["A"] * 5 + ["B"] * 5)
+        assert directional_ipsae(pae, slice(0, 5), slice(5, 10), 10.0) == 0.0
+        assert self.reference_ipsae(pae, chains, "A", "B", 10.0) == 0.0
