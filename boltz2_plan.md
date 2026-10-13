@@ -238,6 +238,65 @@ ipTM, ipSAE and pLDDT distributions are model-specific — run 02/03 showed the
 fork's ipTM running a median 0.22 below holo's on identical sequences. A new
 model means new distributions and therefore new thresholds, on its own run.
 
+## Which mode, and the MSA A/B — both to be decided, not defaulted
+
+### Mode for cross-validation
+
+**Today CV uses no mode at all.** `mode` is a `_FoldingBase` field defaulting to
+`Mode.FAST` (`config.py:527`), so `CrossValidationConfig` inherits it, but as
+`kit_config`'s docstring says it "is defaulted on this base, so a campaign
+cannot be stopped from setting it, but nothing reads it for a non-kit model."
+`af3_fork` is called directly, so no `--mode` exists; the campaign YAML omits
+it deliberately. Refolding, a kit, sets `mode: fast` outright.
+
+The moment Boltz-2 is the CV model, `uses_kit=True` and **`mode` becomes live
+and would silently take the `FAST` default.** State it in the YAML instead, so
+the setting is visible where the stage is configured.
+
+**Recommend `fast`**, and for a reason rather than because it is the kit's
+default: cross-validation already reports a five-seed spread
+(`cv_iptm_best/_mean/_worst`), and `fast` is documented as differing from stock
+only "within the tool's own seed-to-seed variation". `exact`'s bitwise
+guarantee therefore buys nothing this stage can use, while costing throughput
+and pulling in the A100 refused-band risk below. `big` only if `fast` runs out
+of memory — at ~531 tokens it will not.
+
+For refolding the same argument applies and more strongly: apo and holo are a
+one-seed *filter*, and a gate wants a verdict, not bitwise reproducibility.
+
+### Does our unpaired cache cost anything? (phase 5, 4 sequences)
+
+Specified now because it is the experiment that decides whether the pairing
+limitation above matters, and because it mirrors what was already done for the
+fork on 2026-10-09 (one sequence, cached vs `--use_msa_server`: 1,771 paired
+rows per target chain changed ipTM, pTM and ranking_score not at all).
+
+Four sequences, three arms, same seeds throughout:
+
+| arm | `msa:` per chain | flags |
+|---|---|---|
+| A — cache | binder `empty`, targets `<hash>.a3m` | none |
+| B — server | binder `empty`, targets `""` | `--use_msa_server` |
+| C — control | every chain `empty` | none |
+
+Arm B is the point: the server generates **paired and unpaired** alignments and
+returns the pairing, which is the only route by which Boltz receives pairing at
+all. Arm C bounds the comparison from below — if A ≈ C, the cache is buying
+nothing and the MSA is not being read the way we think.
+
+Compare `iptm`, `protein_iptm`, `ptm`, `confidence_score`, `ipsae_min_<target>`
+and `pae_floor_<target>`, plus placement and motif RMSD. Four sequences settles
+nothing statistically; it is a check for a *large* effect, which is what would
+change the design. If B clearly beats A, the choice becomes paying the server
+per prediction against caching unpaired only — and that is a cost decision to
+take with numbers, not now.
+
+Note arm B needs `msa: ""` on the targets, **not** absent-and-hoping: `""` and
+absent both mean auto-generate, and auto-generate without `--use_msa_server` is
+a `RuntimeError`, so the flag and the field have to move together. Mixing arm A
+and arm B chains in one input is refused outright ("Cannot mix custom and
+auto-generated MSAs in the same input!").
+
 ## The `exact`-on-A100 caveat
 
 `STOCK.md:42`: on A100 (cc 8.0) `exact`'s fused pair transition has **no
