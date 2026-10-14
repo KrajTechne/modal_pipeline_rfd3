@@ -69,10 +69,46 @@ cross-validation only means something if a second model does it.
 kit; `af3_fork` drives [sokrypton/alphafold3](https://github.com/sokrypton/alphafold3)
 directly. `boltz2` is planned, see [`boltz2_plan.md`](boltz2_plan.md).
 
-Each model declares what it can do in one place (`MODEL_CAPABILITIES`): whether
-it reads unpaired or paired alignments, whether it templates, how it takes
-seeds, and whether it ships several checkpoints. A campaign asking a model for
-something it cannot do is rejected rather than silently given something else.
+Each model declares what it can do in one place, `MODEL_CAPABILITIES` in
+`config.py`. A campaign asking a model for something it cannot do is rejected
+at config time rather than silently given something else.
+
+| model | wired | kit | templates | unpaired MSA | paired MSA | seeds | variant | weights |
+|---|---|---|---|---|---|---|---|---|
+| `esmfold2` | **refold** | yes | no | yes | no | list | `full_nomsa` / `full_msa` | one |
+| `esmfold2-fast` | — | yes | no | **no** | no | list | `fast` | one |
+| `boltz2` | — | yes | no | yes | no | list | none | one |
+| `af3_jax` | — | yes | yes | yes | **yes** | list | `p2` | `openfold3` ∣ `af3_native` |
+| `af3_fork` | **cv** | **no** | yes | yes | **yes** | list | none | `openfold3` ∣ `af3_native` |
+
+**`wired` is the column that matters.** `FoldingModel` is what the *config*
+understands; dispatching a model also needs an image and a wrapper in `app.py`,
+and only the ones a campaign uses are worth building. A campaign naming an
+unwired model is refused on the client in about a second — without that check it
+would validate happily and die after RFD3, MPNN, apo and holo had all run.
+
+Reading the rest of the row:
+
+- **kit** — driven through the Anthropic inference-optimization kit's `run.sh`,
+  which brings `--mode`, a per-GPU `--config` card and `--n_gpu` sharding.
+  `af3_fork` is called directly, so none of those apply to it and setting them
+  is rejected rather than ignored.
+- **unpaired / paired MSA** — what the model *accepts*, which decides what the
+  cache has to build. Paired alignments are a property of the set of chains
+  queried together, not of one sequence, so they are not cacheable in general;
+  `af3_jax` and `af3_fork` are the rows that make a paired path necessary at
+  all. `esmfold2-fast` reads no alignments, so a cached MSA is built and then
+  ignored — a legitimate cheap-screening choice, and one the banner logs rather
+  than leaving you to infer from a flat ipTM distribution.
+- **templates** — a refolding model that cannot template rejects
+  `target_template: true` instead of quietly dropping it.
+- **variant** — ESMFold2's `--variant` conflates model choice with MSA
+  presence, so it is derived per stage: apo supplies no alignment and gets
+  `full_nomsa`, holo supplies one and gets `full_msa`. Models with `none` have
+  no such flag.
+- **weights** — only `af3_jax` and `af3_fork` ship more than one checkpoint, so
+  `weights:` is rejected for the others. `openfold3` is the default because the
+  AF3 terms are non-commercial; native AF3 weights are a one-word change.
 
 ## Gates
 
